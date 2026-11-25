@@ -9,6 +9,7 @@
 - simulator: 本地接口模拟器（观察版/令牌/页乱序/重送/失效/故障注入）
 - collector: 采集器（流式拉取 JSONL，超内存安全）
 - reader:    下游只读 HTTP 接口（只能读完整观察版，不暴露未发布候选）
+- procurement: 采购端跨供应商同款目录、最低报价与批次变更
 - cli:       命令行入口与场景演示
 """
 
@@ -20,5 +21,7 @@ __all__ = [
     "simulator",
     "collector",
     "reader",
+    "procurement",
+    "cross_catalog",
     "cli",
 ]

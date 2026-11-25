@@ -5,6 +5,7 @@
 ``sim``        启动接口模拟器
 ``collect``    对运行中的模拟器执行采集轮询
 ``read``       启动下游只读服务
+``cross``      采购端跨供应商目录（apply/catalog/changes/serve/demo）
 ``demo``       一条龙端到端演示（自动拉起/关闭两个本地服务）
 ``status``     查看候选覆盖、页清单、接收日志、隔离区、已发布版
 """
@@ -92,6 +93,15 @@ def cmd_status(args: argparse.Namespace) -> None:
         print(json.dumps(out, ensure_ascii=False, indent=2, default=str))
     finally:
         repo.close()
+
+
+def cmd_cross(args: argparse.Namespace) -> int:
+    """转发到采购端跨供应商目录 CLI：``catpipe cross apply ...``。"""
+    if __package__ in (None, ""):
+        from catpipe.procurement import main as cross_main
+    else:
+        from .procurement import main as cross_main
+    return cross_main(args.cross_args)
 
 
 # --------------------------------------------------------------------------- #
@@ -316,13 +326,21 @@ def build_parser() -> argparse.ArgumentParser:
     st = sub.add_parser("status", help="库状态一览")
     st.add_argument("--db", required=True)
     st.set_defaults(func=cmd_status)
+
+    for cross_command in ("cross", "cross-catalog", "procurement", "cross-supplier"):
+        cross = sub.add_parser(
+            cross_command,
+            help="采购端跨供应商目录；后接 apply/catalog/changes/batches/state/demo/serve",
+        )
+        cross.add_argument("cross_args", nargs=argparse.REMAINDER)
+        cross.set_defaults(func=cmd_cross)
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    args.func(args)
-    return 0
+    rc = args.func(args)
+    return int(rc or 0)
 
 
 if __name__ == "__main__":

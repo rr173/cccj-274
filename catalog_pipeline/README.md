@@ -20,6 +20,135 @@
 | 接口允许页乱序与重送 | 内容摘要按 product_id 排序，乱序同内容判 noop；校验基于集合而非顺序 |
 | 展示移窗缺口、重叠撤回、URL 迁移、失效重启 | `python -m` 演示六场景（见下） |
 | 下游只能读完整一个观察版，不能混轮 | 只读连接 + 仅暴露 `published_*`，候选表物理不可见 |
+| **跨供应商同款目录、最低报价、按批次同步** | `catpipe.procurement.CrossCatalog`（见下文专章） |
+
+## 跨供应商同款目录
+
+采购端能力在 `catpipe/procurement.py`，只读取各供应商现有 catpipe 库中的
+`published_versions` / `published_products`，**不改采集协议，也不读候选区**。
+跨供应商状态保存在独立 SQLite 库中：
+
+- `cc_supplier_versions` / `cc_supplier_quotes`：上次成功选版后复制下来的在售报价；
+- `cc_claims` / `cc_claim_endpoints`：人工同款声明及有效无向边；
+- `cc_group_members`：传递连通后的同款组成员（包括暂无报价的声明组）；
+- `cc_catalog`：当前跨供应商目录快照；
+- `cc_batches` / `cc_batch_changes`：成功批次及相对上一成功批次的键级变更。
+
+### 批次 JSON
+
+```jsonc
+{
+  "suppliers": [
+    {"name": "alpha", "db_path": "/data/alpha.db", "version_id": "obs-alpha-v1"},
+    {"name": "beta",  "db_path": "/data/beta.db",  "version_id": "obs-beta-v3"}
+  ],
+  "claims": [
+    {"op": "add", "claim_id": "claim-001",
+     "a": {"supplier": "alpha", "product_id": 10},
+     "b": {"supplier": "beta",  "product_id": 7}},
+    {"op": "replace", "claim_id": "claim-002",
+     "a": {"supplier": "alpha", "product_id": 2},
+     "b": {"supplier": "gamma", "product_id": 5}},
+    {"op": "withdraw", "claim_id": "claim-003"}
+  ]
+}
+```
+
+规则：
+
+- 身份固定为 `(供应商名, 数值稳定商品 ID)`；ID 按数值排序，`10` 不会排在 `2` 前。
+- `add` 必须使用新编号；`replace` / `withdraw` 必须使用当前有效编号。
+- 一批内同一供应商最多选版一次，同一声明编号最多出现一次。
+- 声明两端必须是不同商品；供应商必须已经选版或在本批选版。商品 ID 可以暂时无报价。
+- 有效声明按图传递连通；多个编号支持同一条边。缺货/换版只影响报价，不删除声明。
+- 未在批次中指定 `version_id` 的供应商永不重新打开源库，始终使用上次成功复制的内容。
+- 选版时在源库的一个只读事务中读取指定 `published_versions.version_id` 的
+  `published_products`；版本不存在、库结构不对或声明编辑无效时，整批回滚。
+
+### 目录记录与变更
+
+每组键是全体成员中按 `供应商名` 字典序、再按数值 `product_id` 排序的最小身份。
+组内无任何当前报价时不输出目录记录。最低报价按 `price ASC, supplier ASC,
+product_id ASC` 选择，因此同价时取身份排序最小者。
+
+记录示例：
+
+```json
+{
+  "group_key": {"supplier": "alpha", "product_id": 10},
+  "group_supplier": "alpha",
+  "group_product_id": 10,
+  "members": [
+    {"supplier": "alpha", "product_id": 10},
+    {"supplier": "beta", "product_id": 7},
+    {"supplier": "gamma", "product_id": 3}
+  ],
+  "winning_identity": {"supplier": "beta", "product_id": 7},
+  "supplier": "beta",
+  "product_id": 7,
+  "url": "https://beta.example/item/7",
+  "price": 700,
+  "product_revision": 3
+}
+```
+
+每个成功批次都有连续批次号。变更只包含：
+
+- `op="put"` / `change_type="added"`：新目录键及完整记录；
+- `op="put"` / `change_type="changed"`：记录规范 JSON 发生变化的键及完整新记录；
+- `op="delete"` / `change_type="removed"`：消失的目录键。
+
+批次号、当前快照和变更在同一个 `BEGIN IMMEDIATE` 事务中提交；源版本读取失败、
+声明无效或进程中断都会回滚，重开后只能看到完整成功批次。
+
+### 增量与超内存设计
+
+- 源报价用 `fetchmany(1000)` 流式复制到 `cc_batch_staging`，不 `fetchall` 源库。
+- SQL 集合比对得到 `inserted/changed/deleted` 报价；未换版供应商的源库不会被打开。
+- 报价变化只通过 `cc_group_members` 定位旧组；声明变化只收集该批声明的新旧端点。
+- 图编辑后从这些端点用递归 CTE 重算受影响连通组；未受影响组的成员和快照不动。
+- 目录、成员关系和变更都在 SQLite 磁盘表中；`iter_catalog()` / `iter_changes()`
+  以及 CLI `--format jsonl` 均按 1000 行块流式读取。
+- 历史快照可用批次变更在临时表中重放。
+
+### 本地入口与示例
+
+```bash
+# 生成三个供应商样例库和四份批次 JSON，并跑完三批 + 一次失败批次
+python3 -I examples/cross_catalog_example.py --workdir ./cross-demo
+
+# 应用批次到一个新库（示例主库已经由脚本应用过 batch1~3，重复新增同编号会被正确拒绝）
+python3 -I catpipe/cli.py cross apply \
+  --db ./cross-demo/cli-procurement.db \
+  --batch ./cross-demo/batch1.json
+
+# 查看当前目录 / 第 2 批变更 / 批次列表
+python3 -I catpipe/procurement.py catalog --db ./cross-demo/procurement_catalog.db --format jsonl
+python3 -I catpipe/procurement.py changes --db ./cross-demo/procurement_catalog.db --batch 2
+# 流式导出给下游（JSON Lines，每行一个 put/delete 事件）
+python3 -I catpipe/procurement.py changes --db ./cross-demo/procurement_catalog.db \
+  --batch 2 --format jsonl --out ./cross-demo/changes-2.jsonl
+python3 -I catpipe/procurement.py batches --db ./cross-demo/procurement_catalog.db
+
+# 下游只读 HTTP：/catalog、/changes、/batches/<n>/changes，均支持 keyset 分页
+python3 -I catpipe/procurement.py serve --db ./cross-demo/procurement_catalog.db --port 8091
+```
+
+Python API：
+
+```python
+from catpipe.procurement import CrossCatalog
+
+with CrossCatalog("./procurement_catalog.db") as catalog:
+    receipt = catalog.apply_batch(batch_dict)
+    records = catalog.catalog()          # 小结果便捷方法
+    for record in catalog.iter_catalog():  # 大目录流式读取
+        ...
+    changes = catalog.get_changes(2)
+```
+
+`catpipe.cross_catalog`、`catpipe.cross_supplier`、`catpipe.cross_vendor`
+均为同一实现的命名别名。
 
 ## 目录结构
 
@@ -33,10 +162,16 @@ catalog_pipeline/
 │   ├── simulator.py   # 本地接口模拟器（HTTP/JSONL + 故障注入 + 管理接口）
 │   ├── collector.py   # 流式采集器（轮询、失效弃轮、尝试发布）
 │   ├── reader.py      # 下游只读 HTTP 服务
+│   ├── procurement.py # 跨供应商同款目录、最低报价、批次变更与 CLI
+│   ├── cross_reader.py # 跨供应商目录下游只读 HTTP/分页服务
+│   ├── cross_demo.py  # 可复现跨供应商示例
 │   └── cli.py         # 命令行入口与端到端演示
+├── examples/
+│   └── cross_catalog_example.py # 跨供应商目录复现示例入口
 └── tests/
     ├── test_ingest_publish.py  # 22 条语义单元测试
-    └── test_end_to_end.py      # 5 条 HTTP 端到端测试
+    ├── test_end_to_end.py      # 5 条 HTTP 端到端测试
+    └── test_cross_catalog.py   # 跨供应商分组/批次/原子性测试
 ```
 
 ## 快速开始
@@ -57,6 +192,10 @@ python3 -I catpipe/cli.py status --db ./run/cat.db
 # 3) 测试
 python3 -I tests/test_ingest_publish.py
 python3 -I tests/test_end_to_end.py
+python3 -I tests/test_cross_catalog.py
+
+# 4) 跨供应商目录复现示例
+python3 -I examples/cross_catalog_example.py --workdir ./cross-demo
 ```
 
 ## 线格式（JSONL，每行一个对象）
