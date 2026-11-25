@@ -104,6 +104,25 @@ def cmd_cross(args: argparse.Namespace) -> int:
     return cross_main(args.cross_args)
 
 
+def cmd_audit(args: argparse.Namespace) -> int:
+    """转发到审计历史来源包 CLI：``catpipe audit export ...``。"""
+    if __package__ in (None, ""):
+        from catpipe.audit import main as audit_main
+    else:
+        from .audit import main as audit_main
+    argv = list(getattr(args, "audit_args", None) or [])
+    # 支持 catpipe audit --db x --batch 1 --out y 的隐式 export 形式。
+    if not argv and getattr(args, "db", None):
+        argv = ["export", "--db", args.db]
+        if getattr(args, "batch", None) is not None:
+            argv += ["--batch", str(args.batch)]
+        if getattr(args, "out", None):
+            argv += ["--out", args.out]
+        if getattr(args, "force", False):
+            argv.append("--force")
+    return audit_main(argv)
+
+
 # --------------------------------------------------------------------------- #
 # 端到端演示
 # --------------------------------------------------------------------------- #
@@ -334,6 +353,20 @@ def build_parser() -> argparse.ArgumentParser:
         )
         cross.add_argument("cross_args", nargs=argparse.REMAINDER)
         cross.set_defaults(func=cmd_cross)
+
+    for audit_command in ("audit", "audit-package", "provenance",
+                          "source-package", "history-package"):
+        audit = sub.add_parser(
+            audit_command,
+            help="审计历史来源包；后接 export/verify/status/records",
+        )
+        audit.add_argument("audit_args", nargs=argparse.REMAINDER)
+        # 允许 ``catpipe audit --db ... --batch ... --out ...`` 隐式 export。
+        audit.add_argument("--db", help=argparse.SUPPRESS)
+        audit.add_argument("--batch", type=int, help=argparse.SUPPRESS)
+        audit.add_argument("--out", help=argparse.SUPPRESS)
+        audit.add_argument("--force", action="store_true", help=argparse.SUPPRESS)
+        audit.set_defaults(func=cmd_audit)
     return p
 
 

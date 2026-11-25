@@ -22,6 +22,10 @@ __all__ = [
     "collector",
     "reader",
     "procurement",
+    "audit",
+    "audit_package",
+    "provenance",
+    "source_package",
     "cross_catalog",
     "cli",
 ]

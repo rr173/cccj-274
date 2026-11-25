@@ -1671,6 +1671,31 @@ class CrossCatalog:
         sql += " ORDER BY claim_id"
         return [dict(r) for r in self.conn.execute(sql)]
 
+    # ---- 审计历史来源包 ---------------------------------------------------
+
+    def export_audit_package(
+        self,
+        batch_number: int | None = None,
+        out: str | os.PathLike[str] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """导出某个成功批次时点的审计 JSONL 证据来源包。
+
+        实现位于 :mod:`catpipe.audit`；这里做惰性导入以避免循环依赖。
+        """
+        try:
+            from .audit import export_package
+        except ImportError:  # 直接以脚本运行 procurement.py 时
+            from catpipe.audit import export_package  # type: ignore[no-redef]
+        return export_package(self.db_path, batch_number, out, **kwargs)
+
+    def verify_audit_package(self, target: str | os.PathLike[str]) -> dict[str, Any]:
+        try:
+            from .audit import verify_package
+        except ImportError:
+            from catpipe.audit import verify_package  # type: ignore[no-redef]
+        return verify_package(target)
+
 
 # 常见命名别名，方便不同调用习惯。
 ProcurementCatalog = CrossCatalog
@@ -1689,6 +1714,13 @@ CrossCatalog.get_snapshot = CrossCatalog.snapshot  # type: ignore[attr-defined]
 CrossCatalog.get_catalog = CrossCatalog.catalog  # type: ignore[attr-defined]
 CrossCatalog.list_records = CrossCatalog.catalog  # type: ignore[attr-defined]
 CrossCatalog.latest_batch = CrossCatalog.latest_batch_number  # type: ignore[attr-defined]
+# 审计来源包的方法级别名（兼容不同命名习惯）。
+CrossCatalog.export_audit = CrossCatalog.export_audit_package  # type: ignore[attr-defined]
+CrossCatalog.export_source_package = CrossCatalog.export_audit_package  # type: ignore[attr-defined]
+CrossCatalog.build_audit_package = CrossCatalog.export_audit_package  # type: ignore[attr-defined]
+CrossCatalog.build_source_package = CrossCatalog.export_audit_package  # type: ignore[attr-defined]
+CrossCatalog.audit_package = CrossCatalog.export_audit_package  # type: ignore[attr-defined]
+CrossCatalog.verify_audit = CrossCatalog.verify_audit_package  # type: ignore[attr-defined]
 
 
 def commit_batch(*args: Any, **kwargs: Any) -> dict[str, Any]:
@@ -1734,6 +1766,40 @@ def apply_batch(
         )
     finally:
         catalog.close()
+
+
+def export_audit_package(
+    catalog_db: str | os.PathLike[str] = "cross_catalog.db",
+    batch_number: int | None = None,
+    out: str | os.PathLike[str] | None = None,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """一次性 API：为成功批次导出审计历史来源包（见 :mod:`catpipe.audit`）。"""
+    try:
+        from .audit import export_package
+    except ImportError:
+        from catpipe.audit import export_package  # type: ignore[no-redef]
+    return export_package(catalog_db, batch_number, out, **kwargs)
+
+
+def verify_audit_package(target: str | os.PathLike[str]) -> dict[str, Any]:
+    """一次性 API：离线复核已完成的审计来源包。"""
+    try:
+        from .audit import verify_package
+    except ImportError:
+        from catpipe.audit import verify_package  # type: ignore[no-redef]
+    return verify_package(target)
+
+
+# 审计来源包的模块级别名（兼容不同命名习惯）。
+build_audit_package = export_audit_package
+export_source_package = export_audit_package
+build_source_package = export_audit_package
+create_audit_package = export_audit_package
+export_audit_trail = export_audit_package
+export_history_package = export_audit_package
+export_provenance_package = export_audit_package
+verify_source_package = verify_audit_package
 
 
 # --------------------------------------------------------------------------- #
@@ -1831,6 +1897,63 @@ def cli_suppliers(args: Any) -> int:
     return 0
 
 
+def cli_audit_export(args: Any) -> int:
+    try:
+        result = export_audit_package(
+            args.db, args.batch, args.out, force=args.force
+        )
+    except CrossCatalogError as exc:
+        print(f"审计包导出失败，未产出完成包：{exc}", file=sys.stderr)
+        return 2
+    _emit_json(result)
+    return 0
+
+
+def cli_audit_verify(args: Any) -> int:
+    try:
+        report = verify_audit_package(args.package)
+    except Exception as exc:  # noqa: BLE001 - CLI 边界，统一转退出码
+        try:
+            from .audit import PackageIncomplete, PackageVerificationError
+        except ImportError:
+            from catpipe.audit import (  # type: ignore[no-redef]
+                PackageIncomplete,
+                PackageVerificationError,
+            )
+        if isinstance(exc, PackageIncomplete):
+            print(f"包未完成，不能当作成品：{exc}", file=sys.stderr)
+            return 4
+        if isinstance(exc, PackageVerificationError):
+            _emit_json(exc.report or {"ok": False, "error": str(exc)})
+            return 3
+        print(f"复核失败：{exc}", file=sys.stderr)
+        return 2
+    _emit_json(report)
+    return 0
+
+
+def cli_audit(args: Any) -> int:
+    """转发到 ``catpipe.audit`` 自己的 argparse（export/verify/status/records）。
+
+    也支持不显式写 ``export`` 的自然形式：
+    ``procurement.py audit --db x --batch 1 --out y``。
+    """
+    try:
+        from .audit import main as audit_main
+    except ImportError:
+        from catpipe.audit import main as audit_main  # type: ignore[no-redef]
+    argv = list(getattr(args, "audit_args", None) or [])
+    if not argv and getattr(args, "db", None):
+        argv = ["export", "--db", args.db]
+        if getattr(args, "batch", None) is not None:
+            argv += ["--batch", str(args.batch)]
+        if getattr(args, "out", None):
+            argv += ["--out", args.out]
+        if getattr(args, "force", False):
+            argv.append("--force")
+    return int(audit_main(argv) or 0)
+
+
 def cli_demo(args: Any) -> int:
     if __package__ in (None, ""):
         from catpipe.cross_demo import run_demo
@@ -1884,6 +2007,32 @@ def build_parser() -> Any:
     s = sub.add_parser("state", help="列出已选版供应商和声明")
     s.add_argument("--db", required=True)
     s.set_defaults(func=cli_suppliers)
+
+    ae = sub.add_parser(
+        "audit-export",
+        help="为成功批次导出审计历史来源包（JSONL 证据 + manifest + DONE）",
+    )
+    ae.add_argument("--db", required=True)
+    ae.add_argument("--batch", type=int, help="成功批次号；默认最新成功批次")
+    ae.add_argument("--out", help="包目录或 .jsonl 文件路径")
+    ae.add_argument("--force", action="store_true")
+    ae.set_defaults(func=cli_audit_export)
+
+    av = sub.add_parser("audit-verify", help="只凭导出物全量离线复核已完成的包")
+    av.add_argument("--package", required=True)
+    av.set_defaults(func=cli_audit_verify)
+
+    au = sub.add_parser(
+        "audit",
+        help="审计包完整 CLI 转发：audit export/verify/status/records ...",
+    )
+    au.add_argument("audit_args", nargs=argparse.REMAINDER)
+    # 允许 audit --db ... --batch ... --out ... 的隐式 export 形式。
+    au.add_argument("--db", help=argparse.SUPPRESS)
+    au.add_argument("--batch", type=int, help=argparse.SUPPRESS)
+    au.add_argument("--out", help=argparse.SUPPRESS)
+    au.add_argument("--force", action="store_true", help=argparse.SUPPRESS)
+    au.set_defaults(func=cli_audit)
 
     d = sub.add_parser("demo", help="生成供应商样例库并运行可复现跨目录示例")
     d.add_argument("--workdir", help="示例输出目录（默认临时目录）")
