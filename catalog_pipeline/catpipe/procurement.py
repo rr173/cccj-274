@@ -21,14 +21,33 @@ import sys
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import date as datetime_date
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Sequence
+from typing import Any, Iterator, Sequence
 
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from catpipe.repository import utc_now
+    from catpipe.restrictions import (
+        RestrictionContext,
+        RestrictionError,
+        RestrictionSelection,
+        document_sha256,
+        get_field as _get_field,
+        load_restriction_selection,
+        parse_product_id,
+    )
 else:
     from .repository import utc_now
+    from .restrictions import (
+        RestrictionContext,
+        RestrictionError,
+        RestrictionSelection,
+        document_sha256,
+        get_field as _get_field,
+        load_restriction_selection,
+        parse_product_id,
+    )
 
 __all__ = [
     "ProductRef",
@@ -44,6 +63,8 @@ __all__ = [
     "BatchError",
     "ValidationError",
     "SourceVersionNotFound",
+    "RestrictionContext",
+    "RestrictionSelection",
     "apply_batch",
     "commit_batch",
     "process_batch",
@@ -55,8 +76,8 @@ class CrossCatalogError(Exception):
     """跨供应商目录功能的基础异常。"""
 
 
-class InvalidBatch(CrossCatalogError):
-    """批次内容或声明编辑无效。"""
+class InvalidBatch(CrossCatalogError, RestrictionError):
+    """批次内容或声明编辑无效（同时是限制清单校验失败的异常类型）。"""
 
 
 class BatchValidationError(InvalidBatch):
@@ -212,6 +233,69 @@ CREATE TABLE IF NOT EXISTS cc_batch_new_keys (
     group_product_id INTEGER NOT NULL,
     PRIMARY KEY (batch_number, group_supplier, group_product_id)
 ) WITHOUT ROWID;
+
+-- 按版本发布的商品限制清单（召回/禁采通告）。文档一旦导入即不可变：
+-- 同一 (list_id, version) 再次出现时必须与已存规范文档的 SHA-256 一致。
+CREATE TABLE IF NOT EXISTS cc_restriction_lists (
+    list_id            TEXT NOT NULL,
+    version            TEXT NOT NULL,
+    document_sha256    TEXT NOT NULL,
+    document_json      TEXT NOT NULL,
+    source_path        TEXT,
+    imported_batch     INTEGER NOT NULL,
+    PRIMARY KEY (list_id, version)
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS cc_restriction_entries (
+    list_id         TEXT NOT NULL,
+    version         TEXT NOT NULL,
+    record_id       TEXT NOT NULL,
+    supplier        TEXT NOT NULL,
+    product_id      INTEGER NOT NULL,
+    effective_from  TEXT NOT NULL,
+    effective_to    TEXT,
+    PRIMARY KEY (list_id, version, supplier, product_id, record_id)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_cc_restriction_identity
+    ON cc_restriction_entries(supplier, product_id);
+
+-- 每个成功批次实际采用的限制上下文（显式选择或沿用上一批）。
+CREATE TABLE IF NOT EXISTS cc_batch_restriction_context (
+    batch_number      INTEGER PRIMARY KEY,
+    list_id           TEXT,
+    version           TEXT,
+    as_of             TEXT,
+    document_sha256   TEXT,
+    source            TEXT NOT NULL CHECK (source IN ('selected', 'reused', 'cleared', 'none')),
+    context_changed   INTEGER NOT NULL
+) WITHOUT ROWID;
+
+-- 被该批次有效限制排除的报价及“哪条记录在核算时点有效”的审计依据。
+CREATE TABLE IF NOT EXISTS cc_batch_excluded_quotes (
+    batch_number    INTEGER NOT NULL,
+    supplier        TEXT NOT NULL,
+    product_id      INTEGER NOT NULL,
+    list_id         TEXT NOT NULL,
+    version         TEXT NOT NULL,
+    record_id       TEXT NOT NULL,
+    as_of           TEXT NOT NULL,
+    effective_from  TEXT NOT NULL,
+    effective_to    TEXT,
+    price           INTEGER NOT NULL,
+    url             TEXT NOT NULL,
+    product_revision INTEGER NOT NULL,
+    PRIMARY KEY (batch_number, supplier, product_id)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_cc_excluded_batch
+    ON cc_batch_excluded_quotes(batch_number);
+
+-- 批次内工作表：限制状态发生变化（进入/离开排除集或上下文整体变化）的商品。
+CREATE TABLE IF NOT EXISTS cc_batch_restriction_roots (
+    batch_number INTEGER NOT NULL,
+    supplier     TEXT NOT NULL,
+    product_id   INTEGER NOT NULL,
+    PRIMARY KEY (batch_number, supplier, product_id)
+) WITHOUT ROWID;
 """
 
 
@@ -244,39 +328,10 @@ class ProductRef:
 
 
 def _norm_key(key: Any) -> str:
-    return "".join(ch for ch in str(key).lower() if ch not in "_- ")
+    # 规范实现位于 catpipe.restrictions；保留薄封装供本模块内部调用。
+    from catpipe.restrictions import norm_key
 
-
-def _get_field(obj: dict[str, Any], names: Sequence[str]) -> Any:
-    if not isinstance(obj, dict):
-        return None
-    normalized = {_norm_key(k): v for k, v in obj.items()}
-    for name in names:
-        key = _norm_key(name)
-        if key in normalized and normalized[key] is not None:
-            return normalized[key]
-    return None
-
-
-def parse_product_id(value: Any) -> int:
-    if isinstance(value, ProductRef):
-        return value.product_id
-    if isinstance(value, bool):
-        raise InvalidBatch("product_id 不能是布尔值")
-    if isinstance(value, int):
-        pid = value
-    elif isinstance(value, str) and value.strip():
-        try:
-            pid = int(value.strip())
-        except ValueError as exc:
-            raise InvalidBatch(f"无法解析数值 product_id: {value!r}") from exc
-    elif isinstance(value, float) and value.is_integer():
-        pid = int(value)
-    else:
-        raise InvalidBatch(f"无法解析数值 product_id: {value!r}")
-    if pid < 0:
-        raise InvalidBatch("product_id 不能为负数")
-    return pid
+    return norm_key(key)
 
 
 _SUPPLIER_FIELDS = ("supplier", "supplier_name", "vendor", "vendor_name", "seller", "name")
@@ -690,6 +745,12 @@ class CrossCatalog:
         data = _load_batch_dict(batch)
         supplier_ops = parse_suppliers(data, suppliers)
         claim_ops = parse_claims(data, claims)
+        # 限制清单校验失败统一转成 InvalidBatch：与其它批次校验失败一样
+        # 整批回滚、CLI 返回相同的失败语义，不留下部分目录结果。
+        try:
+            restriction_selection = load_restriction_selection(data)
+        except RestrictionError as exc:
+            raise InvalidBatch(str(exc)) from exc
         raw_input = json.dumps(data, ensure_ascii=False, sort_keys=True, default=str)
 
         with self.transaction() as conn:
@@ -707,10 +768,23 @@ class CrossCatalog:
             self._validate_and_prepare_claims(conn, claim_ops, supplier_ops)
             self._read_selected_sources(conn, supplier_ops)
             quote_counts = self._build_quote_changes(conn, supplier_ops)
-            self._collect_old_keys(conn, batch_number, claim_ops)
+            restriction_info = self._prepare_restriction_context(
+                conn, batch_number, restriction_selection
+            )
+            self._collect_old_keys(
+                conn, batch_number, claim_ops, restriction_info
+            )
             self._apply_supplier_snapshots(conn, batch_number, supplier_ops)
             self._apply_claim_ops(conn, batch_number, claim_ops)
-            new_key_count = self._collect_new_keys(conn, batch_number, claim_ops)
+            new_key_count = self._collect_new_keys(
+                conn, batch_number, claim_ops, restriction_info
+            )
+            restriction_counts = self._populate_exclusions(
+                conn, batch_number, restriction_info
+            )
+            # 上下文行先于组重算写入：_recompute_one_group 需要把清单版本/
+            # 核算时点内嵌进每条目录记录；同事务内失败仍整体回滚。
+            self._record_restriction_context(conn, batch_number, restriction_info)
             change_counts = self._recompute_affected_groups(conn, batch_number)
 
             counts = {
@@ -718,12 +792,14 @@ class CrossCatalog:
                 "claims_submitted": len(claim_ops),
                 "new_keys": new_key_count,
                 **quote_counts,
+                **restriction_counts,
                 **change_counts,
             }
             summary = {
                 "batch_number": batch_number,
                 "previous_batch_number": previous_batch_number,
                 "counts": counts,
+                "restriction": restriction_info["summary"],
             }
             external_batch_id = _get_field(
                 data, ("batch_id", "external_batch_id", "label", "batch_label")
@@ -755,6 +831,7 @@ class CrossCatalog:
             "cc_batch_old_keys",
             "cc_batch_claim_old_keys",
             "cc_batch_new_keys",
+            "cc_batch_restriction_roots",
         ):
             conn.execute(f"DELETE FROM {table}")
 
@@ -835,6 +912,363 @@ class CrossCatalog:
                 raise InvalidBatch(f"供应商 {sel.name!r} 首次选版必须提供 version")
             if sel.db_path is None and existing is None:
                 raise InvalidBatch(f"供应商 {sel.name!r} 首次选版必须提供目录库 db_path")
+
+    # ---- 限制清单（召回/禁采） --------------------------------------------
+
+    def _latest_restriction_context(
+        self, conn: sqlite3.Connection
+    ) -> dict[str, Any] | None:
+        row = conn.execute(
+            "SELECT * FROM cc_batch_restriction_context "
+            "ORDER BY batch_number DESC LIMIT 1"
+        ).fetchone()
+        if row is None or row["list_id"] is None:
+            return None
+        return {
+            "list_id": row["list_id"],
+            "version": row["version"],
+            "as_of": row["as_of"],
+            "document_sha256": row["document_sha256"],
+        }
+
+    def _prepare_restriction_context(
+        self,
+        conn: sqlite3.Connection,
+        batch_number: int,
+        selection: RestrictionSelection | None,
+    ) -> dict[str, Any]:
+        """解析本批实际采用的限制上下文并冻结不可变清单文档。
+
+        任何清单版本/条目无效都会在这里抛 :class:`InvalidBatch`，由外层事务
+        统一回滚，目录与已成功批次都不会留下部分结果。
+        """
+        previous = self._latest_restriction_context(conn)
+
+        if selection is not None and selection.clear:
+            context: RestrictionContext | None = None
+            source = "cleared"
+            changed = previous is not None
+            summary: dict[str, Any] = {
+                "applied": False,
+                "source": source,
+                "context_changed": changed,
+            }
+        elif selection is None:
+            context = (
+                RestrictionContext(
+                    list_id=previous["list_id"],
+                    version=previous["version"],
+                    as_of=datetime_date.fromisoformat(previous["as_of"]),
+                    document_sha256=previous["document_sha256"],
+                )
+                if previous is not None
+                else None
+            )
+            source = "reused" if context is not None else "none"
+            changed = False
+            summary = (
+                {
+                    "applied": True,
+                    "source": source,
+                    "context_changed": False,
+                    **context.as_dict(),
+                }
+                if context is not None
+                else {"applied": False, "source": source, "context_changed": False}
+            )
+        else:
+            digest = document_sha256(selection.document)
+            existing = conn.execute(
+                "SELECT document_sha256,document_json,source_path "
+                "FROM cc_restriction_lists WHERE list_id=? AND version=?",
+                (selection.list_id, selection.version),
+            ).fetchone()
+            if existing is not None and existing["document_sha256"] != digest:
+                raise InvalidBatch(
+                    f"限制清单 {selection.list_id!r}/{selection.version!r} 已按另一份"
+                    "文档导入；已发布清单版本不可变，修订必须使用新版本号"
+                )
+            if existing is None:
+                conn.execute(
+                    "INSERT INTO cc_restriction_lists("
+                    "list_id,version,document_sha256,document_json,source_path,"
+                    "imported_batch) VALUES(?,?,?,?,?,?)",
+                    (
+                        selection.list_id,
+                        selection.version,
+                        digest,
+                        json.dumps(
+                            selection.document,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        selection.source_path,
+                        batch_number,
+                    ),
+                )
+                conn.executemany(
+                    "INSERT INTO cc_restriction_entries("
+                    "list_id,version,record_id,supplier,product_id,"
+                    "effective_from,effective_to) VALUES(?,?,?,?,?,?,?)",
+                    [
+                        (
+                            selection.list_id,
+                            selection.version,
+                            entry["record_id"],
+                            entry["supplier"],
+                            entry["product_id"],
+                            entry["effective_from"],
+                            entry["effective_to"],
+                        )
+                        for entry in selection.document["entries"]
+                    ],
+                )
+            context = RestrictionContext(
+                list_id=selection.list_id,
+                version=selection.version,
+                as_of=selection.as_of,
+                document_sha256=digest,
+            )
+            if previous is None:
+                changed = True
+            else:
+                changed = (
+                    previous["list_id"] != context.list_id
+                    or previous["version"] != context.version
+                    or previous["as_of"] != context.as_of.isoformat()
+                    or previous["document_sha256"] != context.document_sha256
+                )
+            source = "selected"
+            summary = {
+                "applied": True,
+                "source": source,
+                "context_changed": changed,
+                **context.as_dict(),
+            }
+
+        info = {
+            "context": context,
+            "source": source,
+            "changed": bool(changed),
+            "previous": previous,
+            "summary": summary,
+        }
+        # 上下文行在批次末尾（成功路径上）写入；这里暂存到 info 供后续步骤使用。
+        return info
+
+    def _record_restriction_context(
+        self,
+        conn: sqlite3.Connection,
+        batch_number: int,
+        info: dict[str, Any],
+    ) -> None:
+        context: RestrictionContext | None = info["context"]
+        if context is None:
+            conn.execute(
+                "INSERT INTO cc_batch_restriction_context("
+                "batch_number,list_id,version,as_of,document_sha256,"
+                "source,context_changed) VALUES(?,?,?,?,?,?,?)",
+                (
+                    batch_number,
+                    None,
+                    None,
+                    None,
+                    None,
+                    info["source"],
+                    1 if info["changed"] else 0,
+                ),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO cc_batch_restriction_context("
+                "batch_number,list_id,version,as_of,document_sha256,"
+                "source,context_changed) VALUES(?,?,?,?,?,?,?)",
+                (
+                    batch_number,
+                    context.list_id,
+                    context.version,
+                    context.as_of.isoformat(),
+                    context.document_sha256,
+                    info["source"],
+                    1 if info["changed"] else 0,
+                ),
+            )
+
+    def _mark_restriction_old_keys(
+        self, conn: sqlite3.Connection, batch_number: int, info: dict[str, Any]
+    ) -> None:
+        """把受限制影响的现有组记入旧键集合（报价删除/赢家变化都能被重放）。"""
+        context: RestrictionContext | None = info["context"]
+        previous = info["previous"]
+
+        if context is not None and not info["changed"] and previous is not None:
+            # 上下文未变：只有排除状态发生变化的商品所在组需要重算。
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO cc_batch_old_keys(
+                    batch_number,group_supplier,group_product_id)
+                SELECT ?,m.group_supplier,m.group_product_id
+                  FROM cc_batch_restriction_roots r
+                  JOIN cc_group_members m
+                    ON m.supplier=r.supplier AND m.product_id=r.product_id
+                """,
+                (batch_number,),
+            )
+            return
+
+        # 上下文整体变化（首启限制/换版本/换时点/清除限制）：所有现有目录组
+        # 与所有现有成员关系组都要按新上下文重新评价。
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO cc_batch_old_keys(
+                batch_number,group_supplier,group_product_id)
+            SELECT ?,group_supplier,group_product_id
+              FROM (
+                  SELECT DISTINCT group_supplier,group_product_id
+                    FROM cc_group_members
+              )
+            """,
+            (batch_number,),
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO cc_batch_old_keys(
+                batch_number,group_supplier,group_product_id)
+            SELECT ?,group_supplier,group_product_id
+              FROM cc_catalog
+            """,
+            (batch_number,),
+        )
+
+    def _populate_exclusions(
+        self, conn: sqlite3.Connection, batch_number: int, info: dict[str, Any]
+    ) -> dict[str, int]:
+        """计算本批被有效限制排除的报价、审计依据与限制状态变化根。"""
+        context: RestrictionContext | None = info["context"]
+        counts = {
+            "restriction_entries": 0,
+            "restriction_entries_effective": 0,
+            "excluded_quotes": 0,
+        }
+        if context is None:
+            if info["changed"]:
+                # 从有限制变为无限制：上一批被排除的身份全部回到可选集合。
+                self._mark_restriction_old_keys(conn, batch_number, info)
+            return counts
+
+        as_of = context.as_of.isoformat()
+        # 该版本中在核算时点有效的条目（同身份区间不重叠，故最多命中一条）。
+        effective = conn.execute(
+            """
+            SELECT record_id,supplier,product_id,effective_from,effective_to
+              FROM cc_restriction_entries
+             WHERE list_id=? AND version=?
+               AND effective_from<=?
+               AND (effective_to IS NULL OR effective_to>=?)
+            """,
+            (context.list_id, context.version, as_of, as_of),
+        ).fetchall()
+        counts["restriction_entries"] = conn.execute(
+            "SELECT COUNT(*) c FROM cc_restriction_entries "
+            "WHERE list_id=? AND version=?",
+            (context.list_id, context.version),
+        ).fetchone()["c"]
+        counts["restriction_entries_effective"] = len(effective)
+        if not effective:
+            if info["changed"]:
+                self._mark_restriction_old_keys(conn, batch_number, info)
+            return counts
+
+        conn.executemany(
+            """
+            INSERT INTO cc_batch_excluded_quotes(
+                batch_number,supplier,product_id,list_id,version,record_id,
+                as_of,effective_from,effective_to,
+                price,url,product_revision)
+            SELECT ?,e.supplier,e.product_id,?,?,e.record_id,
+                   ?,e.effective_from,e.effective_to,
+                   q.price,q.url,q.product_revision
+              FROM cc_restriction_entries e
+              JOIN cc_supplier_quotes q
+                ON q.supplier=e.supplier AND q.product_id=e.product_id
+             WHERE e.list_id=? AND e.version=? AND e.record_id=?
+            """,
+            [
+                (
+                    batch_number,
+                    context.list_id,
+                    context.version,
+                    as_of,
+                    context.list_id,
+                    context.version,
+                    row["record_id"],
+                )
+                for row in effective
+            ],
+        )
+        counts["excluded_quotes"] = conn.execute(
+            "SELECT COUNT(*) c FROM cc_batch_excluded_quotes WHERE batch_number=?",
+            (batch_number,),
+        ).fetchone()["c"]
+
+        if info["changed"]:
+            self._mark_restriction_old_keys(conn, batch_number, info)
+            return counts
+
+        # 上下文未变：用与上一批排除集的对称差定位限制状态变化的身份。
+        previous_batch = batch_number - 1
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO cc_batch_restriction_roots(
+                batch_number,supplier,product_id)
+            SELECT ?,cur.supplier,cur.product_id
+              FROM cc_batch_excluded_quotes cur
+             WHERE cur.batch_number=?
+               AND NOT EXISTS (
+                   SELECT 1 FROM cc_batch_excluded_quotes prev
+                    WHERE prev.batch_number=?
+                      AND prev.supplier=cur.supplier
+                      AND prev.product_id=cur.product_id)
+            UNION
+            SELECT ?,prev.supplier,prev.product_id
+              FROM cc_batch_excluded_quotes prev
+             WHERE prev.batch_number=?
+               AND NOT EXISTS (
+                   SELECT 1 FROM cc_batch_excluded_quotes cur
+                    WHERE cur.batch_number=?
+                      AND cur.supplier=prev.supplier
+                      AND cur.product_id=prev.product_id)
+            """,
+            (batch_number, batch_number, previous_batch,
+             batch_number, previous_batch, batch_number),
+        )
+        self._mark_restriction_old_keys(conn, batch_number, info)
+        return counts
+
+    def _effective_restriction_for(
+        self,
+        conn: sqlite3.Connection,
+        batch_number: int,
+        supplier: str,
+        product_id: int,
+    ) -> dict[str, Any] | None:
+        """返回某商品在本批排除它的有效限制依据（无则 None）。"""
+        row = conn.execute(
+            "SELECT * FROM cc_batch_excluded_quotes "
+            "WHERE batch_number=? AND supplier=? AND product_id=?",
+            (batch_number, supplier, product_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "list_id": row["list_id"],
+            "version": row["version"],
+            "record_id": row["record_id"],
+            "as_of": row["as_of"],
+            "effective_from": row["effective_from"],
+            "effective_to": row["effective_to"],
+        }
 
     def _effective_source(self, conn: sqlite3.Connection, sel: SupplierSelection) -> tuple[str, str]:
         existing = conn.execute(
@@ -975,7 +1409,11 @@ class CrossCatalog:
         return counts
 
     def _collect_old_keys(
-        self, conn: sqlite3.Connection, batch_number: int, ops: Sequence[ClaimOp]
+        self,
+        conn: sqlite3.Connection,
+        batch_number: int,
+        ops: Sequence[ClaimOp],
+        restriction_info: dict[str, Any] | None = None,
     ) -> None:
         # 报价变化影响到的现有组。
         conn.execute(
@@ -1017,6 +1455,12 @@ class CrossCatalog:
             "UPDATE cc_batch_claim_roots SET batch_number=? WHERE batch_number=0",
             (batch_number,),
         )
+
+        # 限制清单：上下文整体变化时覆盖全部现有组；否则只标记限制状态变化
+        # 的身份所在组（此时排除表尚未填充，先做全量标记，增量标记在
+        # _populate_exclusions 中补入）。
+        if restriction_info is not None and restriction_info["changed"]:
+            self._mark_restriction_old_keys(conn, batch_number, restriction_info)
 
     def _apply_supplier_snapshots(
         self,
@@ -1131,7 +1575,11 @@ class CrossCatalog:
         return ProductRef(row["supplier"], row["product_id"])
 
     def _collect_new_keys(
-        self, conn: sqlite3.Connection, batch_number: int, ops: Sequence[ClaimOp]
+        self,
+        conn: sqlite3.Connection,
+        batch_number: int,
+        ops: Sequence[ClaimOp],
+        restriction_info: dict[str, Any] | None = None,
     ) -> int:
         # 1) 声明根：图已改完，递归求新连通组的最小身份。声明数量通常很少。
         roots = conn.execute(
@@ -1182,6 +1630,22 @@ class CrossCatalog:
             """,
             (batch_number,),
         )
+
+        # 4) 限制上下文整体变化时，所有旧组（含仅存在于 cc_group_members 的
+        #    无报价声明组）都必须按新上下文重算一次。
+        if restriction_info is not None and restriction_info["changed"]:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO cc_batch_new_keys(
+                    batch_number,group_supplier,group_product_id)
+                SELECT ?,group_supplier,group_product_id
+                  FROM (
+                      SELECT DISTINCT group_supplier,group_product_id
+                        FROM cc_group_members
+                  )
+                """,
+                (batch_number,),
+            )
 
         return conn.execute(
             "SELECT COUNT(*) c FROM cc_batch_new_keys WHERE batch_number=?",
@@ -1293,16 +1757,18 @@ class CrossCatalog:
              key.supplier, key.product_id, batch_number),
         )
 
+        member_rows = conn.execute(
+            "SELECT supplier,product_id FROM cc_group_members "
+            "WHERE group_supplier=? AND group_product_id=? "
+            "ORDER BY supplier ASC,product_id ASC",
+            key.key,
+        ).fetchall()
         members = [
-            ProductRef(r["supplier"], r["product_id"]).to_dict()
-            for r in conn.execute(
-                "SELECT supplier,product_id FROM cc_group_members "
-                "WHERE group_supplier=? AND group_product_id=? "
-                "ORDER BY supplier ASC,product_id ASC",
-                key.key,
-            )
+            ProductRef(r["supplier"], r["product_id"]).to_dict() for r in member_rows
         ]
 
+        # 限制只排除报价，绝不改变同款关系：成员关系保持完整；赢家只从
+        # “本批未被有效限制排除”的报价中按现有规则选最低价。
         winner = conn.execute(
             """
             SELECT q.supplier,q.product_id,q.url,q.price,q.product_revision
@@ -1310,10 +1776,16 @@ class CrossCatalog:
               JOIN cc_supplier_quotes q
                 ON q.supplier=g.supplier AND q.product_id=g.product_id
              WHERE g.group_supplier=? AND g.group_product_id=?
+               AND NOT EXISTS (
+                   SELECT 1 FROM cc_batch_excluded_quotes x
+                    WHERE x.batch_number=?
+                      AND x.supplier=q.supplier
+                      AND x.product_id=q.product_id
+               )
              ORDER BY q.price ASC, q.supplier ASC, q.product_id ASC
              LIMIT 1
             """,
-            key.key,
+            (key.supplier, key.product_id, batch_number),
         ).fetchone()
 
         old = conn.execute(
@@ -1323,6 +1795,7 @@ class CrossCatalog:
         ).fetchone()
 
         if winner is None:
+            # 没有可选报价（全部被限制或本就无报价）：不输出该组目录记录。
             conn.execute(
                 "DELETE FROM cc_catalog WHERE group_supplier=? AND group_product_id=?",
                 key.key,
@@ -1348,6 +1821,57 @@ class CrossCatalog:
             "price": winner["price"],
             "product_revision": winner["product_revision"],
         }
+
+        # 该组成员中被本批有效限制排除的报价及其限制依据；无限制时为 null。
+        excluded: list[dict[str, Any]] = []
+        for r in member_rows:
+            basis = self._effective_restriction_for(
+                conn, batch_number, r["supplier"], r["product_id"]
+            )
+            if basis is None:
+                continue
+            quote = conn.execute(
+                "SELECT price,url,product_revision FROM cc_supplier_quotes "
+                "WHERE supplier=? AND product_id=?",
+                (r["supplier"], r["product_id"]),
+            ).fetchone()
+            if quote is None:
+                # 有效条目存在但该身份当前没有报价：无报价可排除，不进排除清单。
+                continue
+            excluded.append({
+                "identity": {"supplier": r["supplier"], "product_id": r["product_id"]},
+                "supplier": r["supplier"],
+                "product_id": r["product_id"],
+                "record_id": basis["record_id"],
+                "list_id": basis["list_id"],
+                "version": basis["version"],
+                "as_of": basis["as_of"],
+                "effective_from": basis["effective_from"],
+                "effective_to": basis["effective_to"],
+                "price": quote["price"],
+                "url": quote["url"],
+                "product_revision": quote["product_revision"],
+            })
+        ctx = conn.execute(
+            "SELECT list_id,version,as_of,document_sha256 "
+            "FROM cc_batch_restriction_context WHERE batch_number=?",
+            (batch_number,),
+        ).fetchone()
+        if ctx is not None and ctx["list_id"] is not None:
+            # 即使本组成员都没有命中有效条目，也记录批次采用的清单版本与时点，
+            # 让每条目录记录都能指出自己是在哪份限制上下文下选出的。
+            record["restriction_context"] = {
+                "list_id": ctx["list_id"],
+                "version": ctx["version"],
+                "as_of": ctx["as_of"],
+                "document_sha256": ctx["document_sha256"],
+            }
+            if excluded:
+                excluded.sort(
+                    key=lambda e: (e["supplier"], e["product_id"], e["record_id"])
+                )
+                record["restrictions"] = excluded
+
         record_json = json.dumps(
             record, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         )
@@ -1671,6 +2195,50 @@ class CrossCatalog:
         sql += " ORDER BY claim_id"
         return [dict(r) for r in self.conn.execute(sql)]
 
+    # ---- 限制清单读取 -----------------------------------------------------
+
+    def restriction_lists(self) -> list[dict[str, Any]]:
+        """已冻结导入的全部限制清单版本（文档不可变）。"""
+        rows = self.conn.execute(
+            "SELECT list_id,version,document_sha256,source_path,imported_batch "
+            "FROM cc_restriction_lists ORDER BY list_id,version"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def restriction_entries(
+        self, list_id: str, version: str
+    ) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT list_id,version,record_id,supplier,product_id,"
+            "effective_from,effective_to FROM cc_restriction_entries "
+            "WHERE list_id=? AND version=? "
+            "ORDER BY supplier,product_id,effective_from,record_id",
+            (list_id, version),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def batch_restriction_context(
+        self, batch_number: int | None = None
+    ) -> dict[str, Any] | None:
+        """某成功批次实际采用的限制上下文；未应用限制时返回 None。"""
+        n = self._resolve_batch_number(batch_number)
+        row = self.conn.execute(
+            "SELECT * FROM cc_batch_restriction_context WHERE batch_number=?", (n,)
+        ).fetchone()
+        if row is None or row["list_id"] is None:
+            return None
+        return dict(row)
+
+    def excluded_quotes(self, batch_number: int | None = None) -> list[dict[str, Any]]:
+        """某成功批次被有效限制排除的报价及限制依据（审计证据）。"""
+        n = self._resolve_batch_number(batch_number)
+        rows = self.conn.execute(
+            "SELECT * FROM cc_batch_excluded_quotes WHERE batch_number=? "
+            "ORDER BY supplier,product_id,record_id",
+            (n,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     # ---- 审计历史来源包 ---------------------------------------------------
 
     def export_audit_package(
@@ -1897,6 +2465,47 @@ def cli_suppliers(args: Any) -> int:
     return 0
 
 
+def cli_restrictions(args: Any) -> int:
+    catalog = CrossCatalog(args.db)
+    try:
+        payload: dict[str, Any] = {
+            "lists": catalog.restriction_lists(),
+            "contexts": [
+                dict(r)
+                for r in catalog.conn.execute(
+                    "SELECT * FROM cc_batch_restriction_context "
+                    "ORDER BY batch_number"
+                ).fetchall()
+            ],
+        }
+        if getattr(args, "list_id", None) and getattr(args, "version", None):
+            payload["entries"] = catalog.restriction_entries(
+                args.list_id, args.version
+            )
+        _emit_json(payload)
+    finally:
+        catalog.close()
+    return 0
+
+
+def cli_excluded(args: Any) -> int:
+    catalog = CrossCatalog(args.db)
+    try:
+        rows = catalog.excluded_quotes(args.batch)
+        if args.format == "jsonl":
+            for row in rows:
+                print(json.dumps(row, ensure_ascii=False, sort_keys=True))
+            return 0
+        _emit_json({
+            "batch_number": args.batch or catalog.latest_batch_number(),
+            "count": len(rows),
+            "excluded_quotes": rows,
+        })
+    finally:
+        catalog.close()
+    return 0
+
+
 def cli_audit_export(args: Any) -> int:
     try:
         result = export_audit_package(
@@ -1963,6 +2572,15 @@ def cli_demo(args: Any) -> int:
     return 0
 
 
+def cli_restriction_demo(args: Any) -> int:
+    if __package__ in (None, ""):
+        from catpipe.restriction_demo import run_demo
+    else:
+        from .restriction_demo import run_demo
+    run_demo(args.workdir)
+    return 0
+
+
 def cli_serve(args: Any) -> int:
     if __package__ in (None, ""):
         from catpipe.cross_reader import serve_forever
@@ -2008,6 +2626,24 @@ def build_parser() -> Any:
     s.add_argument("--db", required=True)
     s.set_defaults(func=cli_suppliers)
 
+    rl = sub.add_parser(
+        "restrictions",
+        help="列出已冻结的限制清单版本与各批次采用的限制上下文",
+    )
+    rl.add_argument("--db", required=True)
+    rl.add_argument("--list-id", dest="list_id", help="可选：查看该清单版本的条目")
+    rl.add_argument("--version", help="与 --list-id 一起使用")
+    rl.set_defaults(func=cli_restrictions)
+
+    ex = sub.add_parser(
+        "excluded",
+        help="列出某成功批次被有效限制排除的报价及限制依据",
+    )
+    ex.add_argument("--db", required=True)
+    ex.add_argument("--batch", type=int, help="默认最新成功批次")
+    ex.add_argument("--format", choices=("json", "jsonl"), default="json")
+    ex.set_defaults(func=cli_excluded)
+
     ae = sub.add_parser(
         "audit-export",
         help="为成功批次导出审计历史来源包（JSONL 证据 + manifest + DONE）",
@@ -2037,6 +2673,13 @@ def build_parser() -> Any:
     d = sub.add_parser("demo", help="生成供应商样例库并运行可复现跨目录示例")
     d.add_argument("--workdir", help="示例输出目录（默认临时目录）")
     d.set_defaults(func=cli_demo)
+
+    rd = sub.add_parser(
+        "restriction-demo",
+        help="生成限制清单样例并运行召回/禁采可复现示例",
+    )
+    rd.add_argument("--workdir", help="示例输出目录（默认临时目录）")
+    rd.set_defaults(func=cli_restriction_demo)
 
     srv = sub.add_parser("serve", help="启动下游只读 HTTP 服务")
     srv.add_argument("--db", required=True)

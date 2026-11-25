@@ -44,6 +44,7 @@ import sqlite3
 import sys
 import uuid
 from dataclasses import dataclass, field
+from datetime import date as datetime_date
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
@@ -55,6 +56,11 @@ if __package__ in (None, ""):
         parse_claims,
         parse_suppliers,
     )
+    from catpipe.restrictions import (  # noqa: E402
+        RestrictionError,
+        is_effective,
+        restriction_selection_header,
+    )
     from catpipe.repository import utc_now  # noqa: E402
 else:
     from .procurement import (  # noqa: E402
@@ -62,6 +68,11 @@ else:
         InvalidBatch,
         parse_claims,
         parse_suppliers,
+    )
+    from .restrictions import (  # noqa: E402
+        RestrictionError,
+        is_effective,
+        restriction_selection_header,
     )
     from .repository import utc_now  # noqa: E402
 
@@ -149,6 +160,10 @@ class AuditConnectionProofMissing(AuditError):
 
 class AuditConsistencyError(AuditError):
     """导出证据与批次持久化记录/来源行之间不一致。"""
+
+
+class AuditRestrictionError(AuditError):
+    """批次锁定的限制清单/排除依据无法重建或与批次事实不一致。"""
 
 
 class PackageError(AuditError):
@@ -291,6 +306,12 @@ class BatchFacts:
     pins: dict[str, Pin] = field(default_factory=dict)
     claims: dict[str, ClaimFact] = field(default_factory=dict)
     unresolved_claims: list[dict[str, Any]] = field(default_factory=list)
+    # 该成功批次实际采用的限制上下文（无限制时为 None）及冻结的清单版本。
+    restriction: dict[str, Any] | None = None
+    restriction_documents: dict[tuple[str, str], dict[str, Any]] = field(
+        default_factory=dict
+    )
+    restriction_inputs: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _open_catalog_readonly(db_path: str | os.PathLike[str]) -> sqlite3.Connection:
@@ -558,6 +579,125 @@ def reconstruct_batch_facts(
                 "reason": "endpoints_at_batch_unavailable_later_replaced",
             })
 
+    # ---- 重放各批次输入中的限制清单选择（只解析头，不打开外部清单文件）----
+    restriction_inputs: list[dict[str, Any]] = []
+    replayed: dict[str, Any] | None = None
+    for br in batch_rows:
+        b = int(br["batch_number"])
+        try:
+            data = json.loads(br["input_json"]) if br["input_json"] else {}
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        try:
+            kind, list_id, version, as_of = restriction_selection_header(data)
+        except RestrictionError as exc:
+            raise AuditHistoryError(
+                f"重放批次 {b} 的限制清单选择失败: {exc}"
+            ) from exc
+        restriction_inputs.append({
+            "batch_number": b, "kind": kind,
+            "list_id": list_id, "version": version, "as_of": as_of,
+        })
+        if kind == "clear":
+            replayed = None
+        elif kind == "select":
+            replayed = {"list_id": list_id, "version": version, "as_of": as_of}
+
+    # 与采购库持久化的批次限制上下文交叉校验（成功批次只增不改）。
+    ctx_row = conn.execute(
+        "SELECT * FROM cc_batch_restriction_context WHERE batch_number=?", (n,)
+    ).fetchone()
+    restriction_fact: dict[str, Any] | None = None
+    if ctx_row is not None and ctx_row["list_id"] is not None:
+        stored = {
+            "list_id": ctx_row["list_id"],
+            "version": ctx_row["version"],
+            "as_of": ctx_row["as_of"],
+            "document_sha256": ctx_row["document_sha256"],
+            "source": ctx_row["source"],
+            "context_changed": bool(ctx_row["context_changed"]),
+        }
+        if replayed is not None:
+            for key_name in ("list_id", "version", "as_of"):
+                if stored[key_name] != replayed[key_name]:
+                    raise AuditHistoryError(
+                        f"批次 {n} 的限制上下文 {key_name} 持久化值 "
+                        f"{stored[key_name]!r} 与批次输入重放值 "
+                        f"{replayed[key_name]!r} 不一致"
+                    )
+            if stored["source"] != "selected":
+                raise AuditHistoryError(
+                    f"批次 {n} 输入显式选择限制清单，但上下文 source="
+                    f"{stored['source']!r}，与采购语义不一致"
+                )
+        restriction_fact = stored
+    else:
+        if replayed is not None:
+            raise AuditHistoryError(
+                f"批次 {n} 的输入显式选择了限制清单 {replayed}，"
+                "但采购库没有对应的限制上下文"
+            )
+
+    # 载入批次 N 时点冻结的清单文档（仅本批或更早导入的版本）。
+    restriction_documents: dict[tuple[str, str], dict[str, Any]] = {}
+    if restriction_fact is not None:
+        list_rows = conn.execute(
+            "SELECT list_id,version,document_sha256,document_json,imported_batch "
+            "FROM cc_restriction_lists WHERE imported_batch<=?",
+            (n,),
+        ).fetchall()
+        for lr in list_rows:
+            try:
+                doc = json.loads(lr["document_json"])
+            except json.JSONDecodeError as exc:
+                raise AuditHistoryError(
+                    f"限制清单 {lr['list_id']!r}/{lr['version']!r} 的冻结文档无法解析"
+                ) from exc
+            restriction_documents[(lr["list_id"], lr["version"])] = {
+                "document": doc,
+                "document_sha256": lr["document_sha256"],
+                "imported_batch": int(lr["imported_batch"]),
+            }
+        key = (restriction_fact["list_id"], restriction_fact["version"])
+        frozen = restriction_documents.get(key)
+        if frozen is None:
+            raise AuditRestrictionError(
+                f"批次 {n} 采用的限制清单 {key[0]!r}/{key[1]!r} "
+                "找不到批次时点冻结的文档"
+            )
+        if frozen["document_sha256"] != restriction_fact["document_sha256"]:
+            raise AuditRestrictionError(
+                f"批次 {n} 锁定的清单 SHA-256 与冻结文档不一致"
+            )
+        # 用批次排除表交叉校验：每条排除都必须能在冻结文档中找到核算时点有效的条目。
+        as_of = datetime_date.fromisoformat(restriction_fact["as_of"])
+        exclusion_rows = conn.execute(
+            "SELECT supplier,product_id,record_id,list_id,version "
+            "FROM cc_batch_excluded_quotes WHERE batch_number=?",
+            (n,),
+        ).fetchall()
+        effective_index: dict[tuple[str, int], list[dict[str, Any]]] = {}
+        for entry in frozen["document"]["entries"]:
+            if is_effective(entry, as_of):
+                effective_index.setdefault(
+                    (entry["supplier"], entry["product_id"]), []
+                ).append(entry)
+        for xr in exclusion_rows:
+            if (xr["list_id"], xr["version"]) != key:
+                raise AuditRestrictionError(
+                    f"批次 {n} 的排除依据引用了非本批清单版本 "
+                    f"{xr['list_id']!r}/{xr['version']!r}"
+                )
+            matches = effective_index.get((xr["supplier"], xr["product_id"]), [])
+            if not any(e["record_id"] == xr["record_id"] for e in matches):
+                raise AuditRestrictionError(
+                    f"批次 {n} 排除报价 {(xr['supplier'], xr['product_id'])} 的记录 "
+                    f"{xr['record_id']!r} 在冻结清单中于 {restriction_fact['as_of']} "
+                    "不处于生效状态"
+                )
+
     input_sha = _sha256_bytes((row["input_json"] or "").encode("utf-8"))
     return BatchFacts(
         batch_number=n,
@@ -569,6 +709,9 @@ def reconstruct_batch_facts(
         pins=pins,
         claims=claims,
         unresolved_claims=unresolved,
+        restriction=restriction_fact,
+        restriction_documents=restriction_documents,
+        restriction_inputs=restriction_inputs,
     )
 
 
@@ -1077,10 +1220,47 @@ def build_group_evidence(
         ),
     }
 
+    # ---- 限制清单：从批次冻结文档独立推导核算时点有效的排除依据 ----------
+    restriction_ctx = facts.restriction
+    effective_restrictions: dict[tuple[str, int], dict[str, Any]] = {}
+    restriction_doc_block: dict[str, Any] | None = None
+    if restriction_ctx is not None:
+        as_of_date = datetime_date.fromisoformat(restriction_ctx["as_of"])
+        frozen = facts.restriction_documents[
+            (restriction_ctx["list_id"], restriction_ctx["version"])
+        ]
+        document = frozen["document"]
+        for entry in document["entries"]:
+            identity = (entry["supplier"], int(entry["product_id"]))
+            if identity not in member_keys:
+                continue
+            if is_effective(entry, as_of_date):
+                if identity in effective_restrictions:
+                    # 采购侧已禁止同身份区间重叠；这里是防御性严格失败。
+                    raise AuditRestrictionError(
+                        f"批次 {batch_n} 组 {group_key} 成员 {identity} 在核算时点 "
+                        f"{restriction_ctx['as_of']} 命中多条有效限制，依据不唯一"
+                    )
+                effective_restrictions[identity] = entry
+        restriction_doc_block = {
+            "list_id": restriction_ctx["list_id"],
+            "version": restriction_ctx["version"],
+            "as_of": restriction_ctx["as_of"],
+            "document_sha256": restriction_ctx["document_sha256"],
+            "frozen_document_sha256": frozen["document_sha256"],
+            "imported_batch": frozen["imported_batch"],
+            "effective_entry_count_in_group": len(effective_restrictions),
+            "selection_rule": (
+                "条目按 (supplier, product_id) 匹配成员；effective_from<=as_of"
+                "<=effective_to（effective_to 为空表示长期有效）时排除该报价"
+            ),
+        }
+
     # ---- 各成员的 N 时点观察版 + 在售行/明确缺席 --------------------------
     version_blocks: dict[str, dict[str, Any]] = {}
     member_entries: list[dict[str, Any]] = []
     on_sale: list[dict[str, Any]] = []
+    eligible: list[dict[str, Any]] = []
 
     for key in sorted(member_keys):
         supplier, pid = key
@@ -1096,6 +1276,7 @@ def build_group_evidence(
             )
         }
         source_row = provider.product_row(supplier, pid)
+        restriction_entry = effective_restrictions.get(key)
         entry: dict[str, Any] = {
             "supplier": supplier,
             "product_id": pid,
@@ -1106,6 +1287,21 @@ def build_group_evidence(
             "observed_version_id": info["version_id"],
             "adopted_version": info["version_id"],
         }
+        if restriction_entry is not None:
+            entry["restriction_status"] = "excluded"
+            entry["restricted"] = True
+            entry["restriction_basis"] = {
+                "list_id": restriction_ctx["list_id"],  # type: ignore[index]
+                "version": restriction_ctx["version"],  # type: ignore[index]
+                "record_id": restriction_entry["record_id"],
+                "as_of": restriction_ctx["as_of"],  # type: ignore[index]
+                "effective_from": restriction_entry["effective_from"],
+                "effective_to": restriction_entry["effective_to"],
+            }
+        else:
+            entry["restriction_status"] = "not_restricted"
+            entry["restricted"] = False
+            entry["restriction_basis"] = None
         if source_row is not None:
             entry["listing_status"] = "on_sale"
             entry["on_sale"] = True
@@ -1113,6 +1309,8 @@ def build_group_evidence(
             entry["source_row"] = source_row
             entry["absence_evidence"] = None
             on_sale.append({"key": key, "row": source_row})
+            if restriction_entry is None:
+                eligible.append({"key": key, "row": source_row})
         else:
             dlo, dhi = info["domain_lo"], info["domain_hi"]
             within = dlo <= pid < dhi
@@ -1158,6 +1356,41 @@ def build_group_evidence(
             f"批次 {batch_n} 组 {group_key} 在源发布版中找不到任何在售行，"
             "与该组存在于目录快照矛盾"
         )
+    if not eligible:
+        # 组内所有在售报价都被有效限制排除时，采购侧不会输出目录记录；
+        # 该组不应出现在快照中，出现即批次事实损坏。
+        raise AuditRestrictionError(
+            f"批次 {batch_n} 组 {group_key} 的全部在售报价都被限制排除，"
+            "按规则该组不应存在目录记录"
+        )
+
+    # 与批次持久化记录中的 restrictions 块交叉核对。
+    recorded_restrictions = record.get("restrictions") or []
+    recorded_basis_index = {
+        _identity_key(item["identity"]): item for item in recorded_restrictions
+    }
+    on_sale_keys = {o["key"] for o in on_sale}
+    for rkey, entry in effective_restrictions.items():
+        if rkey not in on_sale_keys:
+            # 有效条目命中的成员没有在售报价：采购侧不会产生排除行，允许。
+            continue
+        recorded_item = recorded_basis_index.get(rkey)
+        if recorded_item is None:
+            raise AuditRestrictionError(
+                f"批次 {batch_n} 组 {group_key} 的目录记录缺少成员 {rkey} 的限制依据"
+            )
+        if recorded_item.get("record_id") != entry["record_id"]:
+            raise AuditRestrictionError(
+                f"批次 {batch_n} 组 {group_key} 成员 {rkey} 的限制记录编号 "
+                f"{recorded_item.get('record_id')!r} 与冻结清单 "
+                f"{entry['record_id']!r} 不一致"
+            )
+    if len(recorded_basis_index) != len(
+        [k for k in effective_restrictions if k in on_sale_keys]
+    ):
+        raise AuditRestrictionError(
+            f"批次 {batch_n} 组 {group_key} 目录记录的限制依据数量与冻结清单不一致"
+        )
 
     # 规格明确要求：最低报价成员的“完整来源行”必须存在；记录赢家的来源行
     # 缺失属于“缺少来源行”，严格失败而不是把赢家改判给别人后降级导出。
@@ -1175,10 +1408,15 @@ def build_group_evidence(
             "在其锁定观察版中缺少完整来源行（记录为缺席或行已丢失）；"
             "拒绝在缺少赢家来源行时导出"
         )
+    if winner_entry.get("restricted"):
+        raise AuditRestrictionError(
+            f"批次 {batch_n} 组 {group_key} 的记录赢家 {recorded_winner_key} "
+            "被有效限制排除，不能成为可选报价"
+        )
 
-    # ---- 独立重算最低报价赢家，并与批次记录/完整来源行核对 ----------------
+    # ---- 独立重算最低报价赢家（剔除被限制报价），并与批次记录核对 --------
     winner_choice = min(
-        on_sale,
+        eligible,
         key=lambda item: (
             item["row"]["price"], item["key"][0], item["key"][1]
         ),
@@ -1207,10 +1445,35 @@ def build_group_evidence(
                 f"{source_value!r} 不一致"
             )
 
+    excluded_quotes_out = [
+        {
+            "identity": _identity_dict(rkey),
+            "supplier": rkey[0],
+            "product_id": rkey[1],
+            "record_id": entry["record_id"],
+            "list_id": restriction_ctx["list_id"],
+            "version": restriction_ctx["version"],
+            "as_of": restriction_ctx["as_of"],
+            "effective_from": entry["effective_from"],
+            "effective_to": entry["effective_to"],
+            "source_row": next(
+                (o["row"] for o in on_sale if o["key"] == rkey), None
+            ),
+        }
+        for rkey, entry in sorted(effective_restrictions.items())
+        if any(o["key"] == rkey for o in on_sale)
+    ] if restriction_ctx is not None else []
+
     winner_block = {
         "identity": _identity_dict(winner_key),
-        "selection_rule": "minimum of (source_row.price, supplier, product_id)",
-        "selection_rule_sql": "ORDER BY price ASC, supplier ASC, product_id ASC LIMIT 1",
+        "selection_rule": (
+            "minimum of (source_row.price, supplier, product_id) over quotes "
+            "not excluded by an effective restriction entry"
+        ),
+        "selection_rule_sql": (
+            "FROM cc_supplier_quotes q WHERE NOT EXISTS(cc_batch_excluded_quotes) "
+            "ORDER BY price ASC, supplier ASC, product_id ASC LIMIT 1"
+        ),
         "catalog_row": {
             "supplier": record["supplier"],
             "product_id": int(record["product_id"]),
@@ -1223,6 +1486,7 @@ def build_group_evidence(
         "source_row": winner_row,
         "source": winner_row,
         "source_row_matches_catalog_row": True,
+        "restricted_quotes_excluded": len(excluded_quotes_out),
     }
 
     evidence = {
@@ -1243,6 +1507,10 @@ def build_group_evidence(
         "claim_ids": [c["claim_id"] for c in claims_out],
         "connecting_claim_ids": tree_ids,
         "connection_evidence": connection_evidence,
+        # 批次采用的限制清单版本、核算时点与冻结文档指纹。
+        "restriction_context": restriction_doc_block,
+        # 组内被有效限制排除的报价及其记录编号依据（含完整来源行）。
+        "restricted_quotes": excluded_quotes_out,
         # 批次提交时规范化并持久化的完整目录记录，作为采购库侧的事实锚点。
         "catalog_record_at_batch": record,
         "checks": {
@@ -1253,6 +1521,9 @@ def build_group_evidence(
             "spanning_tree_connects_all_members": len(member_keys) == 1 or tree_connected,
             "winner_recomputed_matches": True,
             "winner_source_row_complete": True,
+            "restrictions_applied": restriction_ctx is not None,
+            "restricted_quote_count": len(excluded_quotes_out),
+            "winner_not_restricted": True,
         },
     }
     return evidence
@@ -1336,10 +1607,29 @@ def verify_evidence_record(record: Any) -> list[str]:
 
     # ---- 每个成员：在售完整行 或 可验算的明确缺席 -------------------------
     on_sale: list[dict[str, Any]] = []
+    restricted_keys: set[tuple[str, int]] = set()
+    rctx = record.get("restriction_context")
+    if rctx is not None and not isinstance(rctx, dict):
+        problems.append("restriction_context 必须是对象或 null")
+        rctx = None
     for m in members:
         key = _identity_key(m)
         status = m.get("listing_status")
         row = m.get("source_row")
+        if m.get("restricted") is True:
+            basis = m.get("restriction_basis")
+            if not isinstance(basis, dict) or not basis.get("record_id"):
+                problems.append(f"成员 {key} 标为 restricted 但缺少 restriction_basis.record_id")
+            elif rctx is None:
+                problems.append(f"成员 {key} 被限制但证据缺少 restriction_context")
+            else:
+                if basis.get("list_id") != rctx.get("list_id") or \
+                        basis.get("version") != rctx.get("version") or \
+                        basis.get("as_of") != rctx.get("as_of"):
+                    problems.append(f"成员 {key} 的限制依据与 restriction_context 不一致")
+                restricted_keys.add(key)
+        elif m.get("restricted") is not False:
+            problems.append(f"成员 {key} 缺少布尔 restricted 标记")
         if status == "on_sale":
             if not isinstance(row, dict):
                 problems.append(f"成员 {key} 标为 on_sale 但缺少 source_row")
@@ -1382,6 +1672,91 @@ def verify_evidence_record(record: Any) -> list[str]:
 
     if not on_sale:
         problems.append("整组没有任何在售来源行，无法产生最低报价赢家")
+    eligible = [o for o in on_sale if o["key"] not in restricted_keys]
+    if on_sale and not eligible:
+        problems.append("全部在售报价都被限制排除，该组不应产生目录记录")
+
+    # ---- restricted_quotes 与成员限制标记、目录记录 restrictions 互证 ------
+    restricted_quotes = record.get("restricted_quotes")
+    if rctx is None:
+        if restricted_quotes:
+            problems.append("没有 restriction_context 却出现 restricted_quotes")
+    else:
+        if not isinstance(restricted_quotes, list):
+            problems.append("缺少 restricted_quotes 数组")
+        else:
+            rq_keys = set()
+            on_sale_keys = {o["key"] for o in on_sale}
+            for rq in restricted_quotes:
+                if not isinstance(rq, dict):
+                    problems.append("restricted_quotes 中存在非对象元素")
+                    continue
+                try:
+                    rq_key = _identity_key(rq)
+                except (KeyError, TypeError, ValueError):
+                    problems.append("restricted_quotes 身份无法解析")
+                    continue
+                if rq_key in rq_keys:
+                    problems.append(f"restricted_quotes 中 {rq_key} 重复")
+                rq_keys.add(rq_key)
+                if rq_key not in on_sale_keys:
+                    problems.append(f"restricted_quotes 的 {rq_key} 没有在售来源行")
+                if not rq.get("record_id"):
+                    problems.append(f"restricted_quotes 的 {rq_key} 缺少 record_id")
+                if rq.get("list_id") != rctx.get("list_id") or \
+                        rq.get("version") != rctx.get("version"):
+                    problems.append(f"restricted_quotes 的 {rq_key} 清单版本与 context 不一致")
+                if rq.get("as_of") != rctx.get("as_of"):
+                    problems.append(f"restricted_quotes 的 {rq_key} as_of 与 context 不一致")
+                # 纯离线重算生效性：区间必须覆盖 context 的核算时点。
+                try:
+                    eff_from = datetime_date.fromisoformat(rq["effective_from"])
+                    eff_to = (
+                        datetime_date.fromisoformat(rq["effective_to"])
+                        if rq.get("effective_to") is not None else None
+                    )
+                    as_of_obj = datetime_date.fromisoformat(rctx["as_of"])
+                except (TypeError, ValueError):
+                    problems.append(
+                        f"restricted_quotes 的 {rq_key} 生效日期或 as_of 不是 YYYY-MM-DD"
+                    )
+                else:
+                    if as_of_obj < eff_from or (
+                        eff_to is not None and as_of_obj > eff_to
+                    ):
+                        problems.append(
+                            f"restricted_quotes 的 {rq_key} 记录 {rq.get('record_id')!r} "
+                            f"在核算时点 {rctx.get('as_of')} 不在生效区间内"
+                        )
+                # 成员内嵌依据必须与 restricted_quotes 行一致。
+                member = next(
+                    (m for m in members if _identity_key(m) == rq_key), None
+                )
+                if member is not None:
+                    basis = member.get("restriction_basis")
+                    if not isinstance(basis, dict) or \
+                            basis.get("record_id") != rq.get("record_id"):
+                        problems.append(
+                            f"成员 {rq_key} 的 restriction_basis 与 restricted_quotes 不一致"
+                        )
+            if rq_keys != (restricted_keys & on_sale_keys):
+                problems.append(
+                    "restricted_quotes 与成员 restricted 标记指向的在售报价集合不一致"
+                )
+            cat_rec = record.get("catalog_record_at_batch")
+            if isinstance(cat_rec, dict):
+                cat_restrictions = cat_rec.get("restrictions") or []
+                cat_rq_keys = set()
+                for item in cat_restrictions:
+                    if isinstance(item, dict):
+                        try:
+                            cat_rq_keys.add(_identity_key(item["identity"]))
+                        except (KeyError, TypeError, ValueError):
+                            problems.append("catalog_record restrictions 身份无法解析")
+                if cat_rq_keys != rq_keys:
+                    problems.append(
+                        "catalog_record_at_batch.restrictions 与 restricted_quotes 集合不一致"
+                    )
 
     # ---- 声明与连接证据 ---------------------------------------------------
     claims = record.get("claims")
@@ -1450,18 +1825,21 @@ def verify_evidence_record(record: Any) -> list[str]:
     winner = record.get("winner")
     if not isinstance(winner, dict):
         problems.append("缺少 winner 对象")
-    elif on_sale:
-        best = min(on_sale, key=lambda i: (i["row"]["price"], i["key"][0], i["key"][1]))
+    elif eligible:
+        best = min(eligible, key=lambda i: (i["row"]["price"], i["key"][0], i["key"][1]))
         best_key, best_row = best["key"], best["row"]
         try:
             winner_key = _identity_key(winner["identity"])
         except (KeyError, TypeError, ValueError):
             winner_key = None
             problems.append("winner.identity 无法解析")
-        if winner_key is not None and winner_key != best_key:
-            problems.append(
-                f"独立重算赢家 {best_key} 与导出赢家 {winner_key} 不一致"
-            )
+        if winner_key is not None:
+            if winner_key != best_key:
+                problems.append(
+                    f"独立重算赢家 {best_key} 与导出赢家 {winner_key} 不一致"
+                )
+            if winner_key in restricted_keys:
+                problems.append("赢家身份同时出现在受限报价集合中")
         csr = winner.get("complete_source_row")
         if not isinstance(csr, dict):
             problems.append("winner 缺少 complete_source_row")
@@ -1762,6 +2140,7 @@ def export_package(
         live_stats = {
             "groups": 0, "members": 0, "on_sale_members": 0,
             "absent_members": 0, "claims_listed": 0,
+            "restricted_quotes": 0,
         }
         h = hashlib.sha256()
         evidence_bytes = 0
@@ -1792,6 +2171,9 @@ def export_package(
                         1 for m in evidence["members"] if m["listing_status"] == "absent"
                     )
                     live_stats["claims_listed"] += len(evidence["claims"])
+                    live_stats["restricted_quotes"] += len(
+                        evidence.get("restricted_quotes", [])
+                    )
             _fsync_fileobj(fh)
 
         if live_stats["groups"] != group_count:
@@ -1847,6 +2229,19 @@ def export_package(
                 for p in sorted(facts.pins.values(), key=lambda x: x.supplier)
             ],
             "unresolved_claims": facts.unresolved_claims,
+            "restriction": facts.restriction,
+            "restriction_inputs": facts.restriction_inputs,
+            "restriction_documents": [
+                {
+                    "list_id": key[0],
+                    "version": key[1],
+                    "document_sha256": item["document_sha256"],
+                    "imported_batch": item["imported_batch"],
+                    "entry_count": len(item["document"]["entries"]),
+                    "document": item["document"],
+                }
+                for key, item in sorted(facts.restriction_documents.items())
+            ],
             "counts": verification["stats"],
             "verification": {
                 "performed_before_completion_marker": True,
@@ -2008,6 +2403,7 @@ def _verify_evidence_file(
     stats = {
         "groups": 0, "members": 0, "on_sale_members": 0,
         "absent_members": 0, "claims_listed": 0,
+        "restricted_quotes": 0,
     }
     h = hashlib.sha256()
     size = 0
@@ -2044,6 +2440,7 @@ def _verify_evidence_file(
                 1 for m in rec["members"] if m["listing_status"] == "absent"
             )
             stats["claims_listed"] += len(rec["claims"])
+            stats["restricted_quotes"] += len(rec.get("restricted_quotes", []))
 
     digest = h.hexdigest()
     if expected_sha256 is not None and digest != expected_sha256:

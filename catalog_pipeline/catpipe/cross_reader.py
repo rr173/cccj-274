@@ -3,11 +3,12 @@
 端点
 ====
 ``GET /health``
-``GET /batches``
+``GET /batches``（含每批采用的限制清单版本与核算时点）
 ``GET /latest``
 ``GET /catalog?after_supplier=&after_product_id=&limit=``
 ``GET /changes?batch=&after_supplier=&after_product_id=&limit=``
 ``GET /batches/<n>/changes?...``
+``GET /batches/<n>/excluded``（该批被有效限制排除的报价及记录编号依据）
 
 所有响应都显式带批次号。目录和变更均使用 ``(供应商, 数值商品 ID)`` keyset
 分页，避免一次输出/载入整个大目录。服务以 SQLite ``mode=ro`` 打开采购库，
@@ -50,6 +51,13 @@ def open_cross_readonly(db_path: str) -> sqlite3.Connection:
             CREATE TABLE cc_batch_changes(batch_number INTEGER, op TEXT,
                 change_kind TEXT, group_supplier TEXT, group_product_id INTEGER,
                 record_json TEXT);
+            CREATE TABLE cc_batch_restriction_context(batch_number INTEGER PRIMARY KEY,
+                list_id TEXT, version TEXT, as_of TEXT, document_sha256 TEXT,
+                source TEXT, context_changed INTEGER);
+            CREATE TABLE cc_batch_excluded_quotes(batch_number INTEGER,
+                supplier TEXT, product_id INTEGER, list_id TEXT, version TEXT,
+                record_id TEXT, as_of TEXT, effective_from TEXT, effective_to TEXT,
+                price INTEGER, url TEXT, product_revision INTEGER);
             """
         )
         return conn
@@ -83,8 +91,12 @@ class CrossReaderService:
     def list_batches(self) -> list[dict[str, Any]]:
         try:
             rows = self.conn.execute(
-                "SELECT batch_number,created_at,summary_json "
-                "FROM cc_batches ORDER BY batch_number"
+                "SELECT b.batch_number,b.created_at,b.summary_json,"
+                "       r.list_id,r.version,r.as_of,r.document_sha256,r.source "
+                "FROM cc_batches b "
+                "LEFT JOIN cc_batch_restriction_context r "
+                "  ON r.batch_number=b.batch_number "
+                "ORDER BY b.batch_number"
             ).fetchall()
         except sqlite3.OperationalError:
             return []
@@ -96,8 +108,33 @@ class CrossReaderService:
                 item["summary"] = json.loads(row["summary_json"])
             except (TypeError, json.JSONDecodeError):
                 item["summary"] = None
+            if row["list_id"] is not None:
+                item["restriction_context"] = {
+                    "list_id": row["list_id"],
+                    "version": row["version"],
+                    "as_of": row["as_of"],
+                    "document_sha256": row["document_sha256"],
+                    "source": row["source"],
+                }
+            else:
+                item["restriction_context"] = None
             out.append(item)
         return out
+
+    def excluded_page(self, batch_number: int) -> dict[str, Any]:
+        try:
+            rows = self.conn.execute(
+                "SELECT * FROM cc_batch_excluded_quotes WHERE batch_number=? "
+                "ORDER BY supplier,product_id,record_id",
+                (batch_number,),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return {"batch_number": batch_number, "items": [], "count": 0}
+        return {
+            "batch_number": batch_number,
+            "count": len(rows),
+            "items": [dict(r) for r in rows],
+        }
 
     def _limit(self, query: dict[str, list[str]]) -> int:
         raw = query.get("limit", [str(DEFAULT_LIMIT)])[0]
@@ -246,6 +283,10 @@ class CrossReaderService:
                         parts = path.split("/")
                         n = int(parts[2])
                         self._json(200, service.changes_page(n, query))
+                    elif path.startswith("/batches/") and path.endswith("/excluded"):
+                        parts = path.split("/")
+                        n = int(parts[2])
+                        self._json(200, service.excluded_page(n))
                     else:
                         self._json(404, {"error": "not_found", "path": path})
                 except (ValueError, IndexError):

@@ -21,6 +21,7 @@
 | 展示移窗缺口、重叠撤回、URL 迁移、失效重启 | `python -m` 演示六场景（见下） |
 | 下游只能读完整一个观察版，不能混轮 | 只读连接 + 仅暴露 `published_*`，候选表物理不可见 |
 | **跨供应商同款目录、最低报价、按批次同步** | `catpipe.procurement.CrossCatalog`（见下文专章） |
+| **按版本发布的商品限制清单（召回/禁采）、核算时点生效、排除依据审计** | `catpipe.restrictions` + `catpipe.procurement`（见“商品限制清单”专章） |
 | **面向审计的批次历史来源包、JSONL 证据、离线复核、完成标记** | `catpipe.audit` / `python3 -I catpipe/audit.py`（见“审计历史来源包”专章） |
 
 ## 跨供应商同款目录
@@ -151,6 +152,122 @@ with CrossCatalog("./procurement_catalog.db") as catalog:
 `catpipe.cross_catalog`、`catpipe.cross_supplier`、`catpipe.cross_vendor`
 均为同一实现的命名别名。
 
+## 商品限制清单（召回 / 禁采通告）
+
+采购人员需要把供应商发布的召回或禁采通告落实到跨供应商目录，避免受限报价
+成为可采购结果。能力由 `catpipe/restrictions.py`（清单加载/严格校验/生效
+判定纯函数）与 `catpipe/procurement.py`（批次事务、排除计算、持久化、审计
+依据）共同实现，**不改变采集协议与同款声明语义**。
+
+### 清单文档与批次选择
+
+清单按版本发布，文档一旦被某个成功批次导入即**不可变**；修订必须使用新
+版本号。条目以 `(供应商名, 数值稳定商品 ID)` 标识商品，并给出记录编号与
+生效日期区间（闭区间；`effective_to` 为 `null` 表示长期有效）：
+
+```json
+{
+  "list_id": "product-restrictions",
+  "version": "2026-r1",
+  "entries": [
+    {"record_id": "RC-2026-01", "supplier": "alpha", "product_id": 1,
+     "effective_from": "2026-01-01", "effective_to": "2026-06-30"},
+    {"record_id": "RC-2026-02", "supplier": "beta",  "product_id": 2,
+     "effective_from": "2026-03-01", "effective_to": null}
+  ]
+}
+```
+
+批次通过 `restriction_list`（也接受 `restrictions` / `blocklist` /
+`denylist` / `recall_list` 等同义字段）指定**清单版本与核算时点**：
+
+```json
+{
+  "restriction_list": {
+    "list_id": "product-restrictions",
+    "version": "2026-r1",
+    "as_of": "2026-05-01",
+    "path": "/data/restrictions-2026-r1.json"
+  }
+}
+```
+
+也可以用 `"document": { ... }` 内联整份清单，而不给文件路径。
+
+### 规则与语义
+
+- **仅在核算时点有效的条目排除对应商品的报价**：
+  `effective_from <= as_of <= effective_to`（上限为空表示开放区间）。
+  条目到期后，同一版本换一个更晚的 `as_of` 重跑批次即可自动恢复报价。
+- **限制不改变同款关系**：`cc_claims` / `cc_group_members` 完全不被限制
+  触及；被排除的商品仍是组成员，只是其报价不参与赢家选择。
+- **仍有可选报价时按现有规则选最低价**
+  （`price ASC, supplier ASC, product_id ASC`）；组内报价全部被排除（或本就
+  无报价）时**不输出该组目录记录**，并对下游发出 `removed` 变更。
+- **批次未提及 `restriction_list` 时沿用上一批上下文**（不重新打开清单
+  文件）；显式给 `null`/`false` 则清除限制，本批不应用任何清单。
+- **清单版本不可变**：同一 `(list_id, version)` 再次出现时，文档 SHA-256
+  必须与首次导入一致，否则批次失败；后续修订以新版本号发布，**已成功批次
+  及其审计结果不会被任何后续修订改变**。
+- **严格校验、失败原子**：缺少清单/版本/核算时点、日期非 `YYYY-MM-DD`、
+  区间倒置、记录编号重复、同一商品的条目生效区间重叠（依据不唯一）、文档
+  头与批次指定版本不一致等都会让整批失败；回滚后不留下任何部分目录结果，
+  批次号不前进。
+
+### 持久化与审计证据
+
+- `cc_restriction_lists` / `cc_restriction_entries`：冻结的清单版本（规范
+  JSON + SHA-256）与条目；
+- `cc_batch_restriction_context`：每个成功批次实际采用的清单版本、核算
+  时点、文档指纹，以及来源（`selected` / `reused` / `cleared` / `none`）；
+- `cc_batch_excluded_quotes`：该批次被排除的报价与**有效限制依据**
+  （记录编号、清单版本、核算时点、生效区间、被排除时的报价行快照）；
+- 每条目录记录内嵌 `restriction_context`（清单版本/时点/指纹）与
+  `restrictions[]`（组内被排除报价的记录编号依据），批次变更与下游 HTTP
+  服务自动携带这些字段。
+- 审计来源包（见下章）的每组证据额外包含 `restriction_context`、
+  `restricted_quotes[]`（含完整来源行与记录编号），成员带
+  `restriction_status` / `restriction_basis`；离线复核会**只凭导出物**
+  重新判定每条限制在核算时点是否生效、重算排除集合与最低报价赢家。
+
+### 本地入口与示例
+
+```bash
+# 可复现示例：两供应商 + 两份清单版本（含修订）+ 严格失败演练 + 审计包导出
+python3 -I examples/restriction_example.py --workdir ./restriction-demo
+
+# 已冻结的清单版本与各批次采用的限制上下文
+python3 -I catpipe/procurement.py restrictions \
+  --db ./restriction-demo/procurement_catalog.db
+# 某批次被排除的报价及记录编号依据（支持 --format jsonl）
+python3 -I catpipe/procurement.py excluded \
+  --db ./restriction-demo/procurement_catalog.db --batch 2
+# 目录记录内嵌 restriction_context / restrictions
+python3 -I catpipe/procurement.py catalog \
+  --db ./restriction-demo/procurement_catalog.db --format jsonl
+# 离线复核审计证据（限制生效性与赢家重算全部在复核端独立完成）
+python3 -I catpipe/audit.py verify \
+  --package ./restriction-demo/audit-package-batch2
+```
+
+等价入口：`python3 -I catpipe/cli.py cross restrictions ...`、
+`... cross excluded ...`，以及
+`python3 -I catpipe/procurement.py restriction-demo --workdir ...`。
+
+Python API：
+
+```python
+from catpipe.restrictions import validate_restriction_document, is_effective
+from catpipe.procurement import CrossCatalog
+
+with CrossCatalog("./procurement_catalog.db") as catalog:
+    receipt = catalog.apply_batch(batch_dict)
+    receipt["restriction"]              # 采用的清单版本/核算时点/指纹
+    catalog.restriction_lists()         # 已冻结的不可变清单版本
+    catalog.batch_restriction_context(2)
+    catalog.excluded_quotes(2)          # 排除报价 + 记录编号依据
+```
+
 ## 审计历史来源包（批次时点证据导出）
 
 采购质疑“为什么归成一组、为什么选这个报价”时，`catpipe.audit` 为一个
@@ -226,6 +343,12 @@ for evidence in iter_package_records("./audit-b1"):   # 流式，逐组一条
   的全部同款声明编号与端点（含同一边的多个编号），以及确定性生成树
   `connecting_claim_ids` / `spanning_tree_edges`，可直接验算“这些声明足以
   连通整组”。
+- `restriction_context` 与 `restricted_quotes[]`：第 N 批实际采用的限制
+  清单版本、核算时点与冻结文档 SHA-256，以及组内被有效限制排除的每条报价
+  （记录编号、生效区间与完整来源行）；成员条目带
+  `restriction_status` / `restriction_basis`。复核端只凭导出物重新判定
+  生效性、重算排除集合，并确认赢家不在排除集合中。无限制批次这些字段为
+  `null` / 空数组。
 
 下游不需要任何数据库：`verify_evidence_record(record)`（纯标准库）演示了
 如何只凭一行重算成员排序、最小组键、声明无向图连通分量、生成树连通性、
@@ -276,6 +399,8 @@ catalog_pipeline/
 │   ├── collector.py   # 流式采集器（轮询、失效弃轮、尝试发布）
 │   ├── reader.py      # 下游只读 HTTP 服务
 │   ├── procurement.py # 跨供应商同款目录、最低报价、批次变更与 CLI
+│   ├── restrictions.py# 版本化商品限制清单（召回/禁采）校验与生效判定
+│   ├── restriction_demo.py # 限制清单可复现示例
 │   ├── audit.py       # 审计历史来源包：批次时点证据 JSONL、清单、DONE 与离线复核
 │   ├── audit_demo.py  # 可复现审计包示例（锁定/严格失败/半成品演练）
 │   ├── audit_package.py / provenance.py / source_package.py # audit 的命名别名
@@ -284,11 +409,13 @@ catalog_pipeline/
 │   └── cli.py         # 命令行入口与端到端演示
 ├── examples/
 │   ├── cross_catalog_example.py # 跨供应商目录复现示例入口
+│   ├── restriction_example.py   # 商品限制清单复现示例入口
 │   └── audit_package_example.py # 审计历史来源包复现示例入口
 └── tests/
     ├── test_ingest_publish.py  # 22 条语义单元测试
     ├── test_end_to_end.py      # 5 条 HTTP 端到端测试
     ├── test_cross_catalog.py   # 跨供应商分组/批次/原子性测试
+    ├── test_restrictions.py    # 限制清单校验/排除/上下文/不可变/审计依据测试
     └── test_audit_package.py   # 审计证据包/锁定/严格失败/崩溃安全测试
 ```
 
@@ -311,12 +438,16 @@ python3 -I catpipe/cli.py status --db ./run/cat.db
 python3 -I tests/test_ingest_publish.py
 python3 -I tests/test_end_to_end.py
 python3 -I tests/test_cross_catalog.py
+python3 -I tests/test_restrictions.py
 python3 -I tests/test_audit_package.py
 
 # 4) 跨供应商目录复现示例
 python3 -I examples/cross_catalog_example.py --workdir ./cross-demo
 
-# 5) 审计历史来源包复现示例（导出/锁定/严格失败/离线复核）
+# 5) 商品限制清单（召回/禁采）复现示例
+python3 -I examples/restriction_example.py --workdir ./restriction-demo
+
+# 6) 审计历史来源包复现示例（导出/锁定/严格失败/离线复核）
 python3 -I examples/audit_package_example.py --workdir ./audit-demo
 ```
 

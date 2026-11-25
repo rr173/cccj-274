@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from catpipe.audit import (  # noqa: E402
     AuditBatchNotFound,
     AuditConnectionProofMissing,
+    AuditError,
     AuditSourceMissing,
     AuditSourcePackage,
     PackageIncomplete,
@@ -431,6 +432,183 @@ class AuditPackageCase(unittest.TestCase):
         self.assertEqual(summary["partial_status"], "incomplete")
         self.assertTrue(summary["cross_demo_verify_ok"])
         self.assertTrue(verify_package(summary["package_batch_1"])["ok"])
+
+
+class RestrictionAuditCase(unittest.TestCase):
+    """限制清单批次的审计证据：版本/依据可追溯、离线可重算、后续修订不改变旧包。"""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp(prefix="catpipe-rest-audit-test-")
+        self.a_db = os.path.join(self.tmp, "a.db")
+        self.b_db = os.path.join(self.tmp, "b.db")
+        self.cross_db = os.path.join(self.tmp, "cross.db")
+        self.pkg_b2 = os.path.join(self.tmp, "pkg-b2")
+        publish_supplier(self.a_db, {"v1": [
+            (1, "https://a/1", 60, 1), (2, "https://a/2", 50, 1),
+        ]})
+        publish_supplier(self.b_db, {"v1": [
+            (1, "https://b/1", 80, 1), (2, "https://b/2", 200, 1),
+        ]})
+        self.doc = {
+            "list_id": "L", "version": "r1",
+            "entries": [
+                {"record_id": "RC-1", "supplier": "alpha", "product_id": 1,
+                 "effective_from": "2026-01-01", "effective_to": "2026-06-30"},
+                {"record_id": "RC-2", "supplier": "beta", "product_id": 2,
+                 "effective_from": "2026-03-01", "effective_to": None},
+            ],
+        }
+        self.list_path = os.path.join(self.tmp, "r1.json")
+        with open(self.list_path, "w", encoding="utf-8") as fh:
+            json.dump(self.doc, fh)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _build(self) -> None:
+        with CrossCatalog(self.cross_db) as cat:
+            cat.apply_batch({
+                "suppliers": [
+                    {"name": "alpha", "db_path": self.a_db, "version_id": "v1"},
+                    {"name": "beta", "db_path": self.b_db, "version_id": "v1"},
+                ],
+                "claims": [
+                    {"op": "add", "claim_id": "c1",
+                     "a": ("alpha", 1), "b": ("beta", 1)},
+                    {"op": "add", "claim_id": "c2",
+                     "a": ("alpha", 2), "b": ("beta", 2)},
+                ],
+            }, include_changes=False)
+            cat.apply_batch({"restriction_list": {
+                "list_id": "L", "version": "r1",
+                "as_of": "2026-05-01", "path": self.list_path}}, include_changes=False)
+
+    def test_evidence_carries_list_version_and_exclusion_basis(self):
+        self._build()
+        export_package(self.cross_db, 2, self.pkg_b2)
+        report = verify_package(self.pkg_b2)
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["stats"]["restricted_quotes"], 2)
+
+        records = {
+            (r["group_key"]["supplier"], r["group_key"]["product_id"]): r
+            for r in iter_package_records(self.pkg_b2)
+        }
+        g1 = records[("alpha", 1)]
+        self.assertEqual(g1["restriction_context"]["version"], "r1")
+        self.assertEqual(g1["restriction_context"]["as_of"], "2026-05-01")
+        self.assertTrue(g1["restriction_context"]["document_sha256"])
+        self.assertEqual(
+            g1["winner"]["identity"], {"supplier": "beta", "product_id": 1}
+        )
+        rq = g1["restricted_quotes"]
+        self.assertEqual(len(rq), 1)
+        self.assertEqual(rq[0]["record_id"], "RC-1")
+        self.assertEqual(rq[0]["source_row"]["price"], 60)
+        alpha_member = next(m for m in g1["members"] if m["supplier"] == "alpha")
+        self.assertEqual(alpha_member["restriction_status"], "excluded")
+        self.assertEqual(
+            alpha_member["restriction_basis"]["record_id"], "RC-1"
+        )
+        # 纯离线复核（不打开任何数据库）。
+        for rec in records.values():
+            self.assertEqual(verify_evidence_record(rec), [])
+
+        manifest = json.loads(Path(
+            os.path.join(self.pkg_b2, "manifest.json")
+        ).read_text(encoding="utf-8"))
+        self.assertEqual(manifest["restriction"]["version"], "r1")
+        self.assertEqual(manifest["restriction_documents"][0]["entry_count"], 2)
+
+    def test_no_restriction_batch_has_null_context_and_passes(self):
+        self._build()
+        pkg_b1 = os.path.join(self.tmp, "pkg-b1")
+        export_package(self.cross_db, 1, pkg_b1)
+        rec = list(iter_package_records(pkg_b1))[0]
+        self.assertIsNone(rec["restriction_context"])
+        self.assertEqual(rec["restricted_quotes"], [])
+        self.assertTrue(verify_package(pkg_b1)["ok"])
+
+    def test_later_revision_does_not_change_completed_package(self):
+        self._build()
+        export_package(self.cross_db, 2, self.pkg_b2)
+        before = open(
+            os.path.join(self.pkg_b2, "evidence.jsonl"), "rb"
+        ).read()
+
+        r2 = json.loads(json.dumps(self.doc))
+        r2["version"] = "r2"
+        r2["entries"] = [r2["entries"][0]]  # 解除 RC-2
+        r2_path = os.path.join(self.tmp, "r2.json")
+        with open(r2_path, "w", encoding="utf-8") as fh:
+            json.dump(r2, fh)
+        with CrossCatalog(self.cross_db) as cat:
+            cat.apply_batch({"restriction_list": {
+                "list_id": "L", "version": "r2",
+                "as_of": "2026-10-01", "path": r2_path}}, include_changes=False)
+
+        self.assertTrue(verify_package(self.pkg_b2)["ok"])
+        after = open(
+            os.path.join(self.pkg_b2, "evidence.jsonl"), "rb"
+        ).read()
+        self.assertEqual(before, after)  # 已完成包字节不变
+
+        pkg_b3 = os.path.join(self.tmp, "pkg-b3")
+        export_package(self.cross_db, 3, pkg_b3)
+        self.assertTrue(verify_package(pkg_b3)["ok"])
+        g2 = next(
+            r for r in iter_package_records(pkg_b3)
+            if (r["group_key"]["supplier"], r["group_key"]["product_id"])
+            == ("alpha", 2)
+        )
+        # RC-2 不在 r2 中：beta/2 恢复可选，但 alpha/2(50) 更便宜。
+        self.assertEqual(g2["restricted_quotes"], [])
+        self.assertEqual(
+            g2["winner"]["identity"], {"supplier": "alpha", "product_id": 2}
+        )
+
+    def test_offline_verification_recomputes_effectiveness(self):
+        self._build()
+        export_package(self.cross_db, 2, self.pkg_b2)
+        rec = next(iter(iter_package_records(self.pkg_b2)))
+        # 篡改：把一条已受限报价的生效上限改到核算时点之前，离线复核必须报错。
+        tampered = json.loads(json.dumps(rec))
+        tampered["restricted_quotes"][0]["effective_to"] = "2026-01-01"
+        problems = verify_evidence_record(tampered)
+        self.assertTrue(
+            any("不在生效区间内" in p for p in problems), problems
+        )
+        # 篡改赢家为受限成员也必须被抓出。
+        tampered2 = json.loads(json.dumps(rec))
+        restricted_identity = tampered2["restricted_quotes"][0]["identity"]
+        tampered2["winner"]["identity"] = restricted_identity
+        problems2 = verify_evidence_record(tampered2)
+        self.assertTrue(
+            any("赢家" in p for p in problems2), problems2
+        )
+
+    def test_tampered_frozen_document_fails_export(self):
+        self._build()
+        import sqlite3
+
+        writable = sqlite3.connect(self.cross_db)
+        row = writable.execute(
+            "SELECT document_json FROM cc_restriction_lists"
+        ).fetchone()
+        doc = json.loads(row[0])
+        doc["entries"][0]["record_id"] = "TAMPERED"
+        writable.execute(
+            "UPDATE cc_restriction_lists SET document_json=?",
+            (json.dumps(doc, sort_keys=True),),
+        )
+        writable.commit()
+        writable.close()
+        with self.assertRaises(AuditError):
+            export_package(self.cross_db, 2, self.pkg_b2)
+        # 没有产出完成标记。
+        self.assertEqual(
+            package_status(self.pkg_b2)["status"], "absent"
+        )
 
 
 if __name__ == "__main__":
